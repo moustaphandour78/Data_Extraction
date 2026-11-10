@@ -1,13 +1,11 @@
 """
 Application Streamlit : extraction de données DHIS2
 (un formulaire x une unité d'organisation x N dernières années)
-Trois onglets indépendants : « Extraction », « Complétude » et « Validation ».
-L'onglet « Validation » regroupe : règles de validation, valeurs aberrantes (z-score),
-variations dans le temps et données manquantes (unités silencieuses, retards, zéros), avec lien direct vers la saisie (modèle réglable : DHIS2_LIEN_SAISIE).
+Trois onglets indépendants : « Extraction », « Complétude » et « Qualité des données ».
 Les données extraites sont agrégées par année : pour chaque élément de données, on cumule
 toutes les combinaisons de catégories (categoryOptionCombo).
 
-Installation : pip install streamlit requests pandas python-dotenv
+Installation : pip install streamlit requests pandas python-dotenv plotly
 Lancement    : streamlit run app_dhis2_extract.py
 
 Identifiants : fichier .env placé à côté de ce script (voir .env.example)
@@ -17,6 +15,7 @@ Identifiants : fichier .env placé à côté de ce script (voir .env.example)
     DHIS2_TOKEN=d2pat_...
 """
 import datetime
+import math
 import os
 import re
 from pathlib import Path
@@ -111,47 +110,233 @@ def agreger(data: pd.DataFrame, cumul_ou: bool) -> pd.DataFrame:
     return agg
 
 
-def completude(s, url, dataset, orgunit, annees) -> pd.DataFrame:
-    """Taux de complétude, rapports attendus et saisis par année (analytics DHIS2).
-    Les valeurs couvrent l'unité choisie et ses descendants."""
-    metriques = ["REPORTING_RATE", "EXPECTED_REPORTS", "ACTUAL_REPORTS"]
-    params = {
-        "dimension": [
-            "dx:" + ";".join(f"{dataset}.{m}" for m in metriques),
-            "pe:" + ";".join(str(a) for a in annees),
-            f"ou:{orgunit}",
-        ],
-        "skipMeta": "true",
-    }
+# ---- Complétude : seuils, couleurs, légende ----
+LIB_ROUGE, LIB_JAUNE, LIB_VERT, LIB_NA = "0–70 % (rouge)", "70–90 % (jaune)", "90–100 % (vert)", "Pas de données"
+COULEURS_CLASSES = {LIB_ROUGE: "#d73027", LIB_JAUNE: "#f4d03f", LIB_VERT: "#1a9850", LIB_NA: "#bdbdbd"}
+LEGENDE_COMPLETUDE = "🟥 0–70 % (rouge)   ·   🟨 70–90 % (jaune)   ·   🟩 90–100 % (vert)"
+COL_MOY = "Complétude moyenne (%)"
+METRIQUES_RAPPORTS = ["EXPECTED_REPORTS", "ACTUAL_REPORTS"]
+
+
+def classe_completude(x) -> str:
+    """0–70 : rouge ; 70–90 : jaune ; 90–100 : vert."""
+    if pd.isna(x):
+        return LIB_NA
+    if x < 70:
+        return LIB_ROUGE
+    if x < 90:
+        return LIB_JAUNE
+    return LIB_VERT
+
+
+def style_completude(valeur) -> str:
+    if pd.isna(valeur):
+        return ""
+    couleur = COULEURS_CLASSES[classe_completude(valeur)]
+    texte = "black" if couleur == COULEURS_CLASSES[LIB_JAUNE] else "white"
+    return f"background-color: {couleur}; color: {texte}"
+
+
+def tableau_colore(df: pd.DataFrame, colonnes_taux: list, formats: dict):
+    """Styler : formats + couleurs de la légende sur les colonnes de taux."""
+    sty = df.style.format(formats, na_rep="–")
+    appliquer = getattr(sty, "map", None) or sty.applymap
+    return appliquer(style_completude, subset=colonnes_taux)
+
+
+def _analytics_rows(s, url, dx: str, pe: str, ou: str) -> pd.DataFrame:
+    params = {"dimension": [f"dx:{dx}", f"pe:{pe}", f"ou:{ou}"], "skipMeta": "true"}
     r = s.get(f"{url}/analytics.json", params=params, timeout=300)
     r.raise_for_status()
     j = r.json()
-    df = pd.DataFrame(j.get("rows", []), columns=[h["name"] for h in j["headers"]])
+    return pd.DataFrame(j.get("rows", []), columns=[h["name"] for h in j["headers"]])
+
+
+def _periodes(annees, trimestres) -> str:
+    return ";".join(f"{a}Q{q}" for a in annees for q in trimestres)
+
+
+def completude(s, url, dataset, orgunit, annees, trimestres) -> pd.DataFrame:
+    """Rapports attendus / saisis et taux de complétude par année, sur les trimestres
+    choisis (analytics DHIS2). Couvre l'unité choisie et ses descendantes.
+    Taux = rapports saisis / rapports attendus × 100."""
+    annees = list(annees)
+    dx = ";".join(f"{dataset}.{m}" for m in METRIQUES_RAPPORTS)
+    df = _analytics_rows(s, url, dx, _periodes(annees, trimestres), orgunit)
     if df.empty:
-        piv = pd.DataFrame(index=annees, columns=metriques, dtype=float)
+        piv = pd.DataFrame(index=pd.Index(annees, name="annee"), columns=METRIQUES_RAPPORTS, dtype=float)
     else:
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df["metrique"] = df["dx"].str.split(".").str[-1]
-        piv = df.pivot_table(index="pe", columns="metrique", values="value", aggfunc="sum")
-        piv.index = piv.index.astype(int)
-        piv = piv.reindex(index=annees, columns=metriques)
+        df["annee"] = df["pe"].str[:4].astype(int)
+        piv = df.pivot_table(index="annee", columns="metrique", values="value", aggfunc="sum")
+        piv = piv.reindex(index=pd.Index(annees, name="annee"), columns=METRIQUES_RAPPORTS)
     out = piv.reset_index().rename(
-        columns={
-            "index": "annee",
-            "pe": "annee",
-            "EXPECTED_REPORTS": "rapports_attendus",
-            "ACTUAL_REPORTS": "rapports_saisis",
-            "REPORTING_RATE": "taux_completude",
-        }
+        columns={"EXPECTED_REPORTS": "rapports_attendus", "ACTUAL_REPORTS": "rapports_saisis"}
     )
     out.columns.name = None
+    out["taux_completude"] = (out["rapports_saisis"] / out["rapports_attendus"] * 100).where(
+        out["rapports_attendus"] > 0
+    )
     return out[["annee", "rapports_attendus", "rapports_saisis", "taux_completude"]]
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def completude_cache(url, mode, user, password, token, dataset, orgunit, annees) -> pd.DataFrame:
+def completude_cache(url, mode, user, password, token, dataset, orgunit, annees, trimestres) -> pd.DataFrame:
     s = make_session(mode, user, password, token)
-    return completude(s, url, dataset, orgunit, list(annees))
+    return completude(s, url, dataset, orgunit, annees, trimestres)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def completude_niveau_cache(
+    url, mode, user, password, token, dataset, racine, niveau, annees, trimestres
+) -> pd.DataFrame:
+    """Rapports attendus / saisis (somme sur les années et trimestres choisis) pour chaque
+    unité du niveau demandé sous `racine`."""
+    s = make_session(mode, user, password, token)
+    dx = ";".join(f"{dataset}.{m}" for m in METRIQUES_RAPPORTS)
+    df = _analytics_rows(s, url, dx, _periodes(annees, trimestres), f"LEVEL-{niveau};{racine}")
+    cols = ["ou", "attendus", "saisis"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["metrique"] = df["dx"].str.split(".").str[-1]
+    piv = df.pivot_table(index="ou", columns="metrique", values="value", aggfunc="sum")
+    piv = piv.reindex(columns=METRIQUES_RAPPORTS).reset_index()
+    piv.columns.name = None
+    return piv.rename(columns={"EXPECTED_REPORTS": "attendus", "ACTUAL_REPORTS": "saisis"})[cols]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def unites_assignees(url, mode, user, password, token) -> list:
+    """Unités d'organisation assignées à l'utilisateur connecté (consultation des données
+    si définie, sinon saisie). À défaut, les unités de niveau 1."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/me.json",
+        params={
+            "fields": "organisationUnits[id,displayName,level],"
+            "dataViewOrganisationUnits[id,displayName,level]"
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    j = r.json()
+    unites = j.get("dataViewOrganisationUnits") or j.get("organisationUnits") or []
+    if not unites:
+        r = s.get(
+            f"{url}/organisationUnits.json",
+            params={"fields": "id,displayName,level", "filter": "level:eq:1", "paging": "false"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        unites = r.json().get("organisationUnits", [])
+    return unites
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geometries_niveau(url, mode, user, password, token, racine, niveau) -> list:
+    """Unités du niveau demandé sous `racine`, avec leur géométrie."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/organisationUnits.json",
+        params={
+            "fields": "id,displayName,geometry",
+            "filter": [f"level:eq:{niveau}", f"path:like:{racine}"],
+            "paging": "false",
+        },
+        timeout=300,
+    )
+    r.raise_for_status()
+    return r.json().get("organisationUnits", [])
+
+
+def _points(coords):
+    """Parcourt récursivement des coordonnées GeoJSON et renvoie des (lon, lat)."""
+    if isinstance(coords, (list, tuple)):
+        if len(coords) >= 2 and all(isinstance(x, (int, float)) for x in coords[:2]):
+            yield coords[0], coords[1]
+        else:
+            for c in coords:
+                yield from _points(c)
+
+
+def _centre_geometrie(geom: dict):
+    """Centroïde (lon, lat) du plus grand polygone d'une géométrie GeoJSON."""
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+    meilleur, aire_max = None, -1.0
+    for poly in polys:
+        anneau = poly[0]
+        aire = cx = cy = 0.0
+        for (x0, y0), (x1, y1) in zip(anneau, anneau[1:] + anneau[:1]):
+            croix = x0 * y1 - x1 * y0
+            aire += croix
+            cx += (x0 + x1) * croix
+            cy += (y0 + y1) * croix
+        aire /= 2
+        if abs(aire) > 1e-12:
+            c = (cx / (6 * aire), cy / (6 * aire))
+        else:  # polygone dégénéré : moyenne des sommets
+            c = (sum(p[0] for p in anneau) / len(anneau), sum(p[1] for p in anneau) / len(anneau))
+        if abs(aire) > aire_max:
+            meilleur, aire_max = c, abs(aire)
+    return meilleur
+
+
+def construire_carte(df_map: pd.DataFrame, features: list, etiquettes: bool = True):
+    """Carte choroplèthe avec les classes de la légende (rouge / jaune / vert)."""
+    import plotly.express as px
+
+    pts = [pt for f in features for pt in _points(f["geometry"]["coordinates"])]
+    lons, lats = [p[0] for p in pts], [p[1] for p in pts]
+    centre = {"lon": (min(lons) + max(lons)) / 2, "lat": (min(lats) + max(lats)) / 2}
+    etendue = max(max(lons) - min(lons), (max(lats) - min(lats)) * 1.5, 0.01)
+    zoom = max(1.0, min(12.0, math.log2(450 / (etendue * 1.15))))
+    args = dict(
+        geojson={"type": "FeatureCollection", "features": features},
+        locations="id",
+        featureidkey="properties.id",
+        color="Classe",
+        color_discrete_map=COULEURS_CLASSES,
+        category_orders={"Classe": list(COULEURS_CLASSES)},
+        hover_name="Unité",
+        hover_data={"id": False, "Classe": False, COL_MOY: ":.1f"},
+        center=centre,
+        zoom=zoom,
+        opacity=0.8,
+    )
+    if hasattr(px, "choropleth_map"):
+        fig = px.choropleth_map(df_map, map_style="carto-positron", **args)
+    else:  # plotly < 5.24
+        fig = px.choropleth_mapbox(df_map, mapbox_style="carto-positron", **args)
+    if etiquettes:
+        import plotly.graph_objects as go
+
+        infos = df_map.set_index("id")
+        lon, lat, texte = [], [], []
+        for f in features:
+            uid = f["properties"]["id"]
+            if uid not in infos.index:
+                continue
+            c = _centre_geometrie(f["geometry"])
+            if c is None:
+                continue
+            valeur = infos.at[uid, COL_MOY]
+            val = "–" if pd.isna(valeur) else f"{valeur:.1f}".replace(".", ",") + " %"
+            lon.append(c[0])
+            lat.append(c[1])
+            texte.append(f"{infos.at[uid, 'Unité']}<br><b>{val}</b>")
+        trace = dict(
+            lon=lon, lat=lat, text=texte, mode="text", hoverinfo="skip", showlegend=False,
+            textfont=dict(size=11, color="black"),
+        )
+        fig.add_trace(
+            go.Scattermap(**trace) if hasattr(go, "Scattermap") else go.Scattermapbox(**trace)
+        )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0), height=550, legend_title_text="Complétude moyenne"
+    )
+    return fig
 
 
 # ---- Qualité des données : règles de validation ----
@@ -247,7 +432,7 @@ def analyse_validation(url, mode, user, password, token, groupe, orgunit, debut,
 
 
 def formulaires_a_ouvrir(regle: dict, de_ds: dict, noms_ds: dict) -> tuple:
-    """Formulaire(s) contenant les éléments de la règle : (noms, éléments concernés, UID des formulaires)."""
+    """Formulaire(s) contenant les éléments de la règle + liste des éléments concernés."""
     expr = " ".join(
         ((regle.get(c) or {}).get("expression") or "") for c in ("leftSide", "rightSide")
     )
@@ -259,10 +444,10 @@ def formulaires_a_ouvrir(regle: dict, de_ds: dict, noms_ds: dict) -> tuple:
     for ds in RE_DS.findall(expr):
         compte[ds] = compte.get(ds, 0) + 1
     if not compte:
-        return "", de_ids, []
+        return "", de_ids
     maxi = max(compte.values())
-    ids = sorted((ds for ds, n in compte.items() if n == maxi), key=lambda d: noms_ds.get(d, d))
-    return " | ".join(noms_ds.get(d, d) for d in ids), de_ids, ids
+    noms = sorted(noms_ds.get(ds, ds) for ds, n in compte.items() if n == maxi)
+    return " | ".join(noms), de_ids
 
 
 def vers_nombre(x):
@@ -270,184 +455,6 @@ def vers_nombre(x):
         return float(x)
     except (TypeError, ValueError):
         return None
-
-
-# ---- Validation : liens de saisie, valeurs aberrantes, variations dans le temps ----
-# Modèle du lien vers l'application de saisie (modifiable via DHIS2_LIEN_SAISIE dans le .env)
-MODELE_LIEN = secret(
-    "DHIS2_LIEN_SAISIE",
-    "{base}/dhis-web-aggregate-data-entry/index.html#/?dataSetId={ds}&orgUnitId={ou}&periodId={pe}",
-)
-
-
-def lien_saisie(ds_id, ou_id, pe_id) -> str:
-    """Lien vers la saisie de données (formulaire, unité et période préremplis)."""
-    if not (ds_id and ou_id and pe_id):
-        return ""
-    base = re.sub(r"/api(/\d+)?/?$", "", url)
-    return MODELE_LIEN.format(base=base, ds=ds_id, ou=ou_id, pe=pe_id)
-
-
-def config_liens() -> dict:
-    try:
-        try:
-            col = st.column_config.LinkColumn("Lien de saisie", display_text="Ouvrir ↗")
-        except TypeError:  # anciennes versions de Streamlit
-            col = st.column_config.LinkColumn("Lien de saisie")
-        return {"Lien de saisie": col}
-    except Exception:
-        return {}
-
-
-def premiere_colonne(df: pd.DataFrame, *noms) -> pd.Series:
-    for n in noms:
-        if n in df.columns:
-            return df[n]
-    return pd.Series([None] * len(df), index=df.index, dtype="object")
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def valeurs_aberrantes(url, mode, user, password, token, formulaires, orgunit, debut, fin, algo, seuil, maxi):
-    """Détection statistique DHIS2 (/outlierDetection) sur l'unité et ses descendantes."""
-    s = make_session(mode, user, password, token)
-    params = [("ds", d) for d in formulaires] + [
-        ("ou", orgunit),
-        ("startDate", debut),
-        ("endDate", fin),
-        ("algorithm", algo),
-        ("maxResults", maxi),
-    ]
-    if algo != "MIN_MAX":
-        params.append(("threshold", seuil))
-    r = s.get(f"{url}/outlierDetection.json", params=params, timeout=900)
-    r.raise_for_status()
-    j = r.json()
-    if isinstance(j, dict) and isinstance(j.get("outlierValues"), list):
-        return pd.DataFrame(j["outlierValues"])
-    if isinstance(j, dict) and "rows" in j:
-        cols = [h.get("name") or h.get("column") for h in j.get("headers", [])]
-        return pd.DataFrame(j["rows"], columns=cols)
-    if isinstance(j, list):
-        return pd.DataFrame(j)
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def valeurs_formulaire(url, mode, user, password, token, dataset, orgunit, debut, fin) -> pd.DataFrame:
-    """Valeurs brutes d'un formulaire (unité + enfants) sur une période, avec leur période DHIS2."""
-    s = make_session(mode, user, password, token)
-    r = s.get(
-        f"{url}/dataValueSets.json",
-        params={
-            "dataSet": dataset,
-            "orgUnit": orgunit,
-            "children": "true",
-            "startDate": debut,
-            "endDate": fin,
-        },
-        timeout=900,
-    )
-    r.raise_for_status()
-    return pd.DataFrame(r.json().get("dataValues", []))
-
-
-def anomalies_temporelles(data, controles, hausse, baisse, base_min, nb_constant) -> pd.DataFrame:
-    """Valeurs négatives, variations brutales et séries constantes.
-    Les valeurs sont cumulées sur les combinaisons de catégories, par unité, élément et période.
-    Les périodes comparées sont les périodes consécutives *saisies* (les trous ne sont pas comblés)."""
-    colonnes = ["Anomalie", "orgUnit", "dataElement", "Période", "Valeur",
-                "Valeur précédente", "Variation (%)", "Détail"]
-    if data.empty:
-        return pd.DataFrame(columns=colonnes)
-    d = data.assign(valeur=pd.to_numeric(data["value"], errors="coerce")).dropna(subset=["valeur"])
-    morceaux = []
-
-    if "Valeurs négatives" in controles:
-        neg = d[d["valeur"] < 0]
-        morceaux.append(
-            pd.DataFrame(
-                {
-                    "Anomalie": "Valeur négative",
-                    "orgUnit": neg["orgUnit"],
-                    "dataElement": neg["dataElement"],
-                    "Période": neg["period"],
-                    "Valeur": neg["valeur"],
-                    "Valeur précédente": None,
-                    "Variation (%)": None,
-                    "Détail": "Valeur négative saisie",
-                }
-            )
-        )
-
-    agg = (
-        d.groupby(["orgUnit", "dataElement", "period"], as_index=False)["valeur"]
-        .sum()
-        .sort_values(["orgUnit", "dataElement", "period"])
-    )
-    cle = ["orgUnit", "dataElement"]
-    agg["precedente"] = agg.groupby(cle)["valeur"].shift(1)
-    agg["pe_prec"] = agg.groupby(cle)["period"].shift(1)
-
-    if "Variations brutales" in controles:
-        base = agg["precedente"] >= base_min
-        hausses = agg[base & (agg["valeur"] >= agg["precedente"] * (1 + hausse / 100))]
-        baisses = agg[base & (agg["valeur"] >= 0) & (agg["valeur"] <= agg["precedente"] * (1 - baisse / 100))]
-        for lot, nom in ((hausses, "Hausse brutale"), (baisses, "Baisse brutale")):
-            morceaux.append(
-                pd.DataFrame(
-                    {
-                        "Anomalie": nom,
-                        "orgUnit": lot["orgUnit"],
-                        "dataElement": lot["dataElement"],
-                        "Période": lot["period"],
-                        "Valeur": lot["valeur"],
-                        "Valeur précédente": lot["precedente"],
-                        "Variation (%)": (lot["valeur"] - lot["precedente"]) / lot["precedente"] * 100,
-                        "Détail": "Par rapport à la période " + lot["pe_prec"].astype(str),
-                    }
-                )
-            )
-
-    if "Séries constantes" in controles:
-        agg["rupture"] = ~((agg["valeur"] == agg["precedente"]) & (agg["valeur"] > 0))
-        agg["serie"] = agg.groupby(cle)["rupture"].cumsum()
-        agg["taille"] = agg.groupby(cle + ["serie"])["valeur"].transform("size")
-        longues = agg[agg["taille"] >= nb_constant]
-        if not longues.empty:
-            res = longues.groupby(cle + ["serie"], as_index=False).agg(
-                debut=("period", "first"),
-                fin=("period", "last"),
-                n=("period", "size"),
-                valeur=("valeur", "first"),
-            )
-            morceaux.append(
-                pd.DataFrame(
-                    {
-                        "Anomalie": "Série constante",
-                        "orgUnit": res["orgUnit"],
-                        "dataElement": res["dataElement"],
-                        "Période": res["fin"],
-                        "Valeur": res["valeur"],
-                        "Valeur précédente": None,
-                        "Variation (%)": None,
-                        "Détail": res["n"].astype(str)
-                        + " périodes consécutives identiques ("
-                        + res["debut"].astype(str)
-                        + " → "
-                        + res["fin"].astype(str)
-                        + ")",
-                    }
-                )
-            )
-
-    morceaux = [m for m in morceaux if not m.empty]
-    if not morceaux:
-        return pd.DataFrame(columns=colonnes)
-    res = pd.concat(morceaux, ignore_index=True)[colonnes]
-    for c in ("Valeur", "Valeur précédente", "Variation (%)"):
-        res[c] = pd.to_numeric(res[c], errors="coerce")
-    return res
-
 
 
 # ------------------------------------------------------------------
@@ -475,7 +482,7 @@ if connecte:
 # ------------------------------------------------------------------
 # Corps de la page
 # ------------------------------------------------------------------
-st.title("📊 DHIS2 : extraction, complétude et validation")
+st.title("📊 DHIS2 : extraction et complétude")
 
 try:
     df_ds = lister(url, mode, user, password, token, "dataSets")
@@ -640,6 +647,201 @@ def onglet_extraction():
 # ------------------------------------------------------------------
 # Onglet 2 : complétude (un ou plusieurs formulaires, indépendant de l'extraction)
 # ------------------------------------------------------------------
+def calculer_carte(choix, annees, trimestres) -> dict:
+    """Complétude moyenne des formulaires choisis pour chaque unité du niveau situé
+    juste sous l'unité assignée à l'utilisateur (niveau 1 → régions, niveau 2 → districts)."""
+    unites = unites_assignees(url, mode, user, password, token)
+    erreurs, mesures, geoms, niveaux = [], [], {}, set()
+    for u in unites:
+        niveau = int(u.get("level", 1)) + 1
+        niveaux.add(niveau)
+        try:
+            for g in geometries_niveau(url, mode, user, password, token, u["id"], niveau):
+                geoms[g["id"]] = g
+        except Exception as e:
+            erreurs.append(f"Géométries ({u['displayName']}) : {e}")
+        for ds_id in choix:
+            try:
+                d = completude_niveau_cache(
+                    url, mode, user, password, token, ds_id, u["id"], niveau,
+                    tuple(annees), tuple(trimestres),
+                )
+                mesures.append(d.assign(formulaire=noms_ds.get(ds_id, ds_id)))
+            except Exception as e:
+                erreurs.append(f"{noms_ds.get(ds_id, ds_id)} ({u['displayName']}) : {e}")
+
+    if mesures:
+        allv = pd.concat(mesures, ignore_index=True)
+        allv["taux"] = (allv["saisis"] / allv["attendus"] * 100).where(allv["attendus"] > 0)
+        piv = allv.pivot_table(index="ou", columns="formulaire", values="taux", aggfunc="mean")
+    else:
+        piv = pd.DataFrame()
+    ids = sorted(set(piv.index) | set(geoms))
+    tab = piv.reindex(ids)
+    tab[COL_MOY] = tab.mean(axis=1, skipna=True) if len(tab.columns) else float("nan")
+    tab.index.name = "id"
+    tab = tab.reset_index()
+    tab["Unité"] = tab["id"].map(lambda i: (geoms.get(i) or {}).get("displayName") or noms_ou.get(i, i))
+    tab["Classe"] = tab[COL_MOY].map(classe_completude)
+
+    features = [
+        {"type": "Feature", "properties": {"id": g["id"]}, "geometry": g["geometry"]}
+        for g in geoms.values()
+        if (g.get("geometry") or {}).get("type") in ("Polygon", "MultiPolygon")
+    ]
+    libelle = {frozenset({2}): "région", frozenset({3}): "district"}.get(frozenset(niveaux), "unité")
+    return {
+        "table": tab,
+        "features": features,
+        "libelle": libelle,
+        "racines": ", ".join(u["displayName"] for u in unites),
+        "erreurs": erreurs,
+    }
+
+
+def libelle_niveau(niveau: int) -> tuple:
+    """(singulier, pluriel) du niveau hiérarchique."""
+    return {2: ("DRS", "DRS"), 3: ("district", "districts")}.get(niveau, ("unité", "unités"))
+
+
+def fmt_pct(x) -> str:
+    return "–" if pd.isna(x) else f"{x:.2f}".replace(".", ",") + " %"
+
+
+def fmt_nb(n: int, niveau: int) -> str:
+    sing, plur = libelle_niveau(niveau)
+    return f"{n} {sing if n <= 1 else plur}"
+
+
+def evol_points(a, b) -> tuple:
+    """Évolution d'un taux en points. Renvoie (texte, sens) ; sens : +1 mieux, -1 recul, 0 stable."""
+    if pd.isna(a) or pd.isna(b):
+        return "–", 0
+    d = b - a
+    if abs(d) < 0.005:
+        return "Stable", 0
+    mot = "point" if abs(d) < 2 else "points"
+    signe = "+" if d > 0 else "-"
+    return f"{signe} {abs(d):.2f}".replace(".", ",") + f" {mot}", (1 if d > 0 else -1)
+
+
+def evol_compte(a: int, b: int, plus_est_mieux: bool) -> tuple:
+    d = b - a
+    if d == 0:
+        return "Stable", 0
+    mieux = (d > 0) == plus_est_mieux
+    return f"{'Progression' if mieux else 'Recul'} ({d:+d})", (1 if mieux else -1)
+
+
+def indicateurs_periode(choix, unites, annees, trimestres) -> dict:
+    """Complétude moyenne (niveau de l'unité assignée) et complétude moyenne par unité
+    aux deux niveaux situés sous elle (ex. : DRS puis districts)."""
+    niv_racine = min(int(u.get("level", 1)) for u in unites)
+    racines = [u for u in unites if int(u.get("level", 1)) == niv_racine]
+    na, nb = niv_racine + 1, niv_racine + 2
+    cadres = {na: [], nb: []}
+    for u in racines:
+        for niv in (na, nb):
+            for ds_id in choix:
+                d = completude_niveau_cache(
+                    url, mode, user, password, token, ds_id, u["id"], niv,
+                    tuple(annees), tuple(trimestres),
+                )
+                cadres[niv].append(d.assign(formulaire=noms_ds.get(ds_id, ds_id)))
+    out = {"na": na, "nb": nb, "racines": racines, "unites": {}}
+    for niv, frames in cadres.items():
+        allv = (
+            pd.concat(frames, ignore_index=True)
+            if frames
+            else pd.DataFrame(columns=["ou", "attendus", "saisis", "formulaire"])
+        )
+        allv[["attendus", "saisis"]] = allv[["attendus", "saisis"]].astype(float)
+        allv["taux"] = (allv["saisis"] / allv["attendus"] * 100).where(allv["attendus"] > 0)
+        if allv["taux"].notna().any():
+            out["unites"][niv] = (
+                allv.pivot_table(index="ou", columns="formulaire", values="taux", aggfunc="mean")
+                .mean(axis=1)
+            )
+        else:
+            out["unites"][niv] = pd.Series(dtype=float)
+        if niv == na:  # moyenne globale : taux cumulé par formulaire, puis moyenne des formulaires
+            g = allv.groupby("formulaire")[["attendus", "saisis"]].sum()
+            taux_form = (g["saisis"] / g["attendus"] * 100).where(g["attendus"] > 0)
+            out["moyenne"] = taux_form.mean() if len(taux_form) else float("nan")
+    return out
+
+
+def tableau_comparaison(ia: dict, ib: dict, label_a: str, label_b: str) -> tuple:
+    """Construit le tableau de comparaison (DataFrame) et la liste des sens d'évolution."""
+    na, nb = ia["na"], ia["nb"]
+    ua, ub = ia["unites"], ib["unites"]
+    maj = lambda t: t[0].upper() + t[1:]
+    plur_a, plur_b = maj(libelle_niveau(na)[1]), maj(libelle_niveau(nb)[1])
+    noms = ", ".join(u["displayName"] for u in ia["racines"])
+    niv_racine = na - 1
+    titre_moy = "Complétude moyenne nationale" if niv_racine == 1 else f"Complétude moyenne ({noms})"
+
+    lignes, sens = [], []
+
+    def ajouter(indicateur, va, vb, evol):
+        lignes.append({"Indicateur": indicateur, label_a: va, label_b: vb, "Évolution": evol[0]})
+        sens.append(evol[1])
+
+    ajouter(titre_moy, fmt_pct(ia["moyenne"]), fmt_pct(ib["moyenne"]), evol_points(ia["moyenne"], ib["moyenne"]))
+    comptes = [
+        (f"{plur_a} avec complétude > 90 %", na, lambda x: int((x > 90).sum()), True),
+        (f"{plur_a} avec complétude < 75 %", na, lambda x: int((x < 75).sum()), False),
+        (f"{plur_b} à 100 %", nb, lambda x: int((x >= 100).sum()), True),
+        (f"{plur_b} < 50 %", nb, lambda x: int((x < 50).sum()), False),
+    ]
+    for titre, niv, f, plus_est_mieux in comptes:
+        a, b = f(ua[niv]), f(ub[niv])
+        ajouter(titre, fmt_nb(a, niv), fmt_nb(b, niv), evol_compte(a, b, plus_est_mieux))
+    return pd.DataFrame(lignes), sens
+
+
+def section_comparaison(res: dict):
+    """Comparaison de deux périodes (trimestre ou année) parmi celles du dernier calcul."""
+    options = {}
+    for a in res["annees"]:
+        for q in res["trimestres_liste"]:
+            options[f"T{q} {a}"] = ((a,), (q,))
+        options[f"Année {a}"] = ((a,), (1, 2, 3, 4))
+    labels = list(options)
+
+    st.subheader("Comparaison de deux périodes")
+    c1, c2 = st.columns(2)
+    with c1:
+        la = st.selectbox("Période 1 (référence)", labels, index=0, key="cmp_a")
+    with c2:
+        lb = st.selectbox("Période 2 (comparée)", labels, index=min(1, len(labels) - 1), key="cmp_b")
+    if la == lb:
+        st.info("Choisissez deux périodes différentes pour les comparer.")
+        return
+    try:
+        unites = unites_assignees(url, mode, user, password, token)
+        with st.spinner("Calcul de la comparaison…"):
+            ia = indicateurs_periode(res["choix"], unites, *options[la])
+            ib = indicateurs_periode(res["choix"], unites, *options[lb])
+    except Exception as e:
+        st.warning(f"Comparaison impossible : {e}")
+        return
+
+    df, sens = tableau_comparaison(ia, ib, la, lb)
+    st.markdown(f"**Comparaison {la} vs {lb}**")
+    couleurs = {1: "color: #1a9850; font-weight: 600", -1: "color: #d73027; font-weight: 600", 0: ""}
+    st.dataframe(
+        df.style.apply(lambda col: [couleurs[x] for x in sens], subset=["Évolution"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "Évolution = période 2 par rapport à la période 1. Complétude moyenne des formulaires "
+        "sélectionnés ; les seuils s'appliquent à la moyenne de chaque unité. "
+        "Vert : amélioration, rouge : recul."
+    )
+
+
 def onglet_completude():
     st.caption(
         "Rapports attendus, saisis et taux de complétude (analytics DHIS2) pour un ou "
@@ -655,16 +857,26 @@ def onglet_completude():
         )
     with col2:
         orgunit_id = choisir_unite("comp")
-    annees = sorted(
-        st.multiselect(
-            "Années", options=options_annees, default=annees_defaut, key="comp_annees"
+    col3, col4 = st.columns(2)
+    with col3:
+        annees = sorted(
+            st.multiselect("Années", options=options_annees, default=annees_defaut, key="comp_annees")
         )
-    )
+    with col4:
+        trimestres = sorted(
+            st.multiselect(
+                "Trimestres",
+                options=[1, 2, 3, 4],
+                default=[1, 2, 3, 4],
+                format_func=lambda q: f"T{q}",
+                key="comp_trim",
+            )
+        )
 
     if st.button(
         "📈 Calculer la complétude",
         type="primary",
-        disabled=not (choix and orgunit_id and annees),
+        disabled=not (choix and orgunit_id and annees and trimestres),
         key="comp_go",
     ):
         morceaux, erreurs = [], []
@@ -672,17 +884,28 @@ def onglet_completude():
         for i, ds_id in enumerate(choix):
             try:
                 c = completude_cache(
-                    url, mode, user, password, token, ds_id, orgunit_id, tuple(annees)
+                    url, mode, user, password, token, ds_id, orgunit_id, tuple(annees), tuple(trimestres)
                 )
                 morceaux.append(c.assign(formulaire=noms_ds.get(ds_id, ds_id)))
             except Exception as e:
                 erreurs.append(f"{noms_ds.get(ds_id, ds_id)} : {e}")
             barre.progress((i + 1) / len(choix), text=noms_ds.get(ds_id, ds_id))
+        barre.text("Calcul de la carte…")
+        try:
+            carte = calculer_carte(choix, annees, trimestres)
+        except Exception as e:
+            carte = None
+            erreurs.append(f"Carte : {e}")
         barre.empty()
         st.session_state["comp_result"] = {
             "data": pd.concat(morceaux, ignore_index=True) if morceaux else None,
             "erreurs": erreurs,
             "unite": noms_ou.get(orgunit_id, orgunit_id),
+            "trimestres": ", ".join(f"T{q}" for q in trimestres),
+            "carte": carte,
+            "choix": list(choix),
+            "annees": list(annees),
+            "trimestres_liste": list(trimestres),
         }
 
     res = st.session_state.get("comp_result")
@@ -690,48 +913,89 @@ def onglet_completude():
         return
     if res["erreurs"]:
         st.warning(
-            "Complétude indisponible pour certains formulaires (analytics non généré "
-            "ou droits insuffisants) :\n\n" + "\n\n".join(res["erreurs"])
+            "Calcul impossible pour certains éléments (analytics non généré, droits "
+            "insuffisants ou erreur serveur) :\n\n" + "\n\n".join(res["erreurs"])
         )
+
     comp = res["data"]
-    if comp is None:
+    if comp is not None:
+        st.subheader(f"Complétude : {res['unite']}")
+        st.caption(f"Trimestres retenus : {res['trimestres']}. Légende : {LEGENDE_COMPLETUDE}")
+        affichage = comp.assign(Trimestres=res["trimestres"])[
+            ["formulaire", "annee", "Trimestres", "rapports_attendus", "rapports_saisis", "taux_completude"]
+        ].rename(
+            columns={
+                "formulaire": "Formulaire",
+                "annee": "Année",
+                "rapports_attendus": "Rapports attendus",
+                "rapports_saisis": "Rapports saisis",
+                "taux_completude": "Complétude (%)",
+            }
+        )
+        st.dataframe(
+            tableau_colore(
+                affichage,
+                ["Complétude (%)"],
+                {"Rapports attendus": "{:.0f}", "Rapports saisis": "{:.0f}", "Complétude (%)": "{:.1f}"},
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.markdown("**Comparaison des taux de complétude par année**")
+        graph = comp.assign(annee=comp["annee"].astype(str)).pivot_table(
+            index="annee", columns="formulaire", values="taux_completude", aggfunc="first"
+        )
+        try:
+            st.bar_chart(graph, stack=False, y_label="Complétude (%)", x_label="Année")
+        except TypeError:  # anciennes versions de Streamlit
+            st.bar_chart(graph)
+
+    section_comparaison(res)
+
+    carte = res.get("carte")
+    if carte is None:
+        return
+    st.subheader(f"Carte : complétude moyenne par {carte['libelle']}")
+    st.caption(
+        f"Moyenne des taux de complétude des formulaires sélectionnés, par {carte['libelle']} "
+        f"sous : {carte['racines']}. Légende : {LEGENDE_COMPLETUDE}"
+    )
+    tab = carte["table"]
+    if tab.empty:
+        st.info("Aucune unité trouvée pour ce niveau.")
         return
 
-    st.subheader(f"Complétude : {res['unite']}")
-    affichage = comp[
-        ["formulaire", "annee", "rapports_attendus", "rapports_saisis", "taux_completude"]
-    ].rename(
-        columns={
-            "formulaire": "Formulaire",
-            "annee": "Année",
-            "rapports_attendus": "Rapports attendus",
-            "rapports_saisis": "Rapports saisis",
-            "taux_completude": "Complétude (%)",
-        }
-    )
+    ids_geo = {f["properties"]["id"] for f in carte["features"]}
+    if ids_geo:
+        etiquettes = st.checkbox(
+            "Afficher les étiquettes (nom et valeur)", value=True, key="carte_etiquettes"
+        )
+        try:
+            fig = construire_carte(
+                tab[tab["id"].isin(ids_geo)],
+                [f for f in carte["features"]],
+                etiquettes,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.warning("La carte nécessite plotly : `pip install plotly`.")
+    else:
+        st.info("Aucune géométrie (polygone) disponible pour ces unités : la carte ne peut pas être tracée.")
+
+    cols_form = [c for c in tab.columns if c not in ("id", "Unité", "Classe", COL_MOY)]
+    detail = tab[["Unité", COL_MOY] + cols_form].sort_values("Unité")
     st.dataframe(
-        affichage.style.format(
-            {"Rapports attendus": "{:.0f}", "Rapports saisis": "{:.0f}", "Complétude (%)": "{:.1f}"},
-            na_rep="–",
-        ),
+        tableau_colore(detail, [COL_MOY] + cols_form, {c: "{:.1f}" for c in [COL_MOY] + cols_form}),
         hide_index=True,
         use_container_width=True,
     )
 
-    st.markdown("**Comparaison des taux de complétude par année**")
-    graph = comp.assign(annee=comp["annee"].astype(str)).pivot_table(
-        index="annee", columns="formulaire", values="taux_completude", aggfunc="first"
-    )
-    try:
-        st.bar_chart(graph, stack=False, y_label="Complétude (%)", x_label="Année")
-    except TypeError:  # anciennes versions de Streamlit
-        st.bar_chart(graph)
-
 
 # ------------------------------------------------------------------
-# Onglet 3 : validation (groupes de règles de validation)
+# Onglet 3 : qualité des données (règles de validation)
 # ------------------------------------------------------------------
-def section_regles():
+def onglet_qualite():
     st.caption(
         "Exécute les règles de validation, groupe par groupe, sur l'unité d'organisation "
         "choisie (et ses descendantes) et liste les erreurs à corriger."
@@ -770,7 +1034,7 @@ def section_regles():
     )
 
     if st.button(
-        "🔎 Lancer la validation",
+        "🔎 Lancer le contrôle qualité",
         type="primary",
         disabled=not (choix and orgunit_id and debut <= fin),
         key="qd_go",
@@ -799,7 +1063,7 @@ def section_regles():
             for v in violations:
                 rid = v.get("validationRuleId") or (v.get("validationRule") or {}).get("id")
                 regle = regles.get(rid, {})
-                formulaire, de_ids, ds_ids = formulaires_a_ouvrir(regle, de_ds, noms_formulaires)
+                formulaire, de_ids = formulaires_a_ouvrir(regle, de_ds, noms_formulaires)
                 imp = IMPORTANCE.get(v.get("importance") or regle.get("importance"), "")
                 op = v.get("operator") or regle.get("operator") or ""
                 gauche = vers_nombre(v.get("leftsideValue"))
@@ -820,11 +1084,6 @@ def section_regles():
                         "Formulaire(s) à ouvrir": formulaire,
                         "Éléments de données à vérifier": ", ".join(noms_de.get(d, d) for d in de_ids),
                         "Instruction de correction": regle.get("instruction", ""),
-                        "Lien de saisie": lien_saisie(
-                            ds_ids[0] if ds_ids else "",
-                            v.get("organisationUnitId"),
-                            v.get("periodId"),
-                        ),
                     }
                 )
         barre.empty()
@@ -877,603 +1136,13 @@ def section_regles():
             st.caption("✅ Aucune erreur dans ce groupe.")
             continue
         with st.expander(f"❌ {groupe} : {len(sous)} erreur(s)", expanded=True):
-            st.dataframe(
-                sous,
-                hide_index=True,
-                use_container_width=True,
-                height=min(500, 40 + 35 * len(sous)),
-                column_config=config_liens(),
-            )
+            st.dataframe(sous, hide_index=True, use_container_width=True, height=min(500, 40 + 35 * len(sous)))
 
 
-# ------------------------------------------------------------------
-# Validation : valeurs aberrantes (algorithmes statistiques DHIS2)
-# ------------------------------------------------------------------
-def section_aberrantes():
-    st.caption(
-        "Détection statistique des valeurs aberrantes par DHIS2 (z-score, z-score modifié ou "
-        "min-max) : repère des valeurs absurdes qu'aucune règle de validation ne couvre."
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        choix = st.multiselect(
-            "Formulaires",
-            options=df_ds["id"].tolist(),
-            format_func=lambda i: noms_ds.get(i, i),
-            key="ab_ds",
-        )
-    with col2:
-        orgunit_id = choisir_unite("ab")
-    col3, col4 = st.columns(2)
-    aujourdhui = datetime.date.today()
-    with col3:
-        debut = st.date_input(
-            "Début de la période contrôlée",
-            value=aujourdhui - datetime.timedelta(days=365),
-            key="ab_debut",
-        )
-    with col4:
-        fin = st.date_input("Fin de la période contrôlée", value=aujourdhui, key="ab_fin")
-    col5, col6, col7 = st.columns(3)
-    with col5:
-        algo = st.selectbox(
-            "Algorithme",
-            ["Z_SCORE", "MODIFIED_Z_SCORE", "MIN_MAX"],
-            format_func={
-                "Z_SCORE": "Z-score",
-                "MODIFIED_Z_SCORE": "Z-score modifié (robuste)",
-                "MIN_MAX": "Min-max (bornes définies dans DHIS2)",
-            }.get,
-            key="ab_algo",
-        )
-    with col6:
-        seuil = st.number_input(
-            "Seuil",
-            min_value=1.0,
-            max_value=10.0,
-            value=3.0,
-            step=0.5,
-            disabled=algo == "MIN_MAX",
-            help="Plus le seuil est bas, plus on détecte de valeurs (et de faux positifs).",
-            key="ab_seuil",
-        )
-    with col7:
-        maxi = st.number_input(
-            "Nombre maximum de résultats", min_value=10, max_value=10000, value=500, step=100, key="ab_max"
-        )
-    st.caption(
-        "La moyenne et l'écart-type sont calculés sur tout l'historique disponible ; seules les "
-        "valeurs de la période choisie sont contrôlées."
-    )
-
-    if st.button(
-        "🔎 Chercher les valeurs aberrantes",
-        type="primary",
-        disabled=not (choix and orgunit_id and debut <= fin),
-        key="ab_go",
-    ):
-        try:
-            with st.spinner("Analyse en cours…"):
-                brut = valeurs_aberrantes(
-                    url, mode, user, password, token, tuple(choix), orgunit_id,
-                    debut.isoformat(), fin.isoformat(), algo, float(seuil), int(maxi),
-                )
-                de_ds, noms_de, noms_formulaires = elements_et_formulaires(
-                    url, mode, user, password, token
-                )
-        except Exception as e:
-            st.error(
-                f"Détection impossible : {e}\n\nVérifiez que l'endpoint /outlierDetection est "
-                "disponible sur votre instance et que vous avez les droits de lecture."
-            )
-            return
-
-        if brut.empty:
-            st.session_state["ab_result"] = {"df": None}
-        else:
-            de = premiere_colonne(brut, "de", "dataElement")
-            ou = premiere_colonne(brut, "ou", "orgUnit")
-            pe = premiere_colonne(brut, "pe", "period")
-            formulaires, liens = [], []
-            for d_id, o_id, p_id in zip(de, ou, pe):
-                dss = de_ds.get(d_id, [])
-                pref = [x for x in dss if x in choix] or dss
-                formulaires.append(" | ".join(noms_formulaires.get(x, x) for x in pref))
-                liens.append(lien_saisie(pref[0] if pref else "", o_id, p_id))
-            nom_de = premiere_colonne(brut, "deName", "dataElementName")
-            nom_ou = premiere_colonne(brut, "ouName", "orgUnitName")
-            affich = pd.DataFrame(
-                {
-                    "Formulaire(s)": formulaires,
-                    "Élément de données": nom_de.where(nom_de.notna(), de.map(noms_de)),
-                    "Combinaison de catégories": premiere_colonne(brut, "cocName", "categoryOptionComboName"),
-                    "Unité d'organisation": nom_ou.where(nom_ou.notna(), ou.map(noms_ou)),
-                    "Période": pe,
-                    "Valeur": pd.to_numeric(premiere_colonne(brut, "value"), errors="coerce"),
-                    "Moyenne": pd.to_numeric(premiere_colonne(brut, "mean"), errors="coerce"),
-                    "Médiane": pd.to_numeric(premiere_colonne(brut, "median"), errors="coerce"),
-                    "Écart-type": pd.to_numeric(premiere_colonne(brut, "stdDev"), errors="coerce"),
-                    "Borne basse": pd.to_numeric(premiere_colonne(brut, "lowerBound"), errors="coerce"),
-                    "Borne haute": pd.to_numeric(premiere_colonne(brut, "upperBound"), errors="coerce"),
-                    "Score": pd.to_numeric(
-                        premiere_colonne(brut, "zScore", "modifiedZScore"), errors="coerce"
-                    ),
-                    "Lien de saisie": liens,
-                }
-            ).dropna(axis=1, how="all")
-            st.session_state["ab_result"] = {
-                "df": affich,
-                "unite": noms_ou.get(orgunit_id, orgunit_id),
-                "periode": f"{debut.isoformat()} → {fin.isoformat()}",
-                "limite": len(affich) >= int(maxi),
-            }
-
-    res = st.session_state.get("ab_result")
-    if not res:
-        return
-    if res["df"] is None:
-        st.success("Aucune valeur aberrante détectée avec ces paramètres. ✅")
-        return
-    df = res["df"]
-    st.subheader(f"Valeurs aberrantes : {res['unite']} ({res['periode']})")
-    st.metric("Valeurs à vérifier", f"{len(df):,}".replace(",", " "))
-    if res["limite"]:
-        st.warning("Le nombre maximum de résultats est atteint : augmentez-le ou relevez le seuil.")
-    st.download_button(
-        "⬇️ Télécharger les valeurs aberrantes (CSV)",
-        data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="dhis2_valeurs_aberrantes.csv",
-        mime="text/csv",
-    )
-    for form, sous in df.groupby("Formulaire(s)", sort=True):
-        sous = sous.drop(columns="Formulaire(s)")
-        with st.expander(f"❌ {form or 'Formulaire inconnu'} : {len(sous)} valeur(s)", expanded=True):
-            st.dataframe(
-                sous,
-                hide_index=True,
-                use_container_width=True,
-                height=min(500, 40 + 35 * len(sous)),
-                column_config=config_liens(),
-            )
-
-
-# ------------------------------------------------------------------
-# Validation : cohérence dans le temps (variations, séries constantes, négatifs)
-# ------------------------------------------------------------------
-def section_variations():
-    st.caption(
-        "Compare chaque valeur à la période précédente saisie (par unité et par élément de "
-        "données, toutes combinaisons de catégories cumulées) pour repérer les variations brutales, "
-        "les séries de valeurs identiques (copier-coller) et les valeurs négatives."
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        dataset_id = st.selectbox(
-            "Formulaire",
-            options=df_ds["id"].tolist(),
-            format_func=lambda i: noms_ds.get(i, i),
-            key="vt_ds",
-        )
-    with col2:
-        orgunit_id = choisir_unite("vt")
-    col3, col4 = st.columns(2)
-    aujourdhui = datetime.date.today()
-    with col3:
-        debut = st.date_input("Début", value=datetime.date(annee_fin - 1, 1, 1), key="vt_debut")
-    with col4:
-        fin = st.date_input("Fin", value=aujourdhui, key="vt_fin")
-    controles = st.multiselect(
-        "Contrôles à appliquer",
-        ["Variations brutales", "Séries constantes", "Valeurs négatives"],
-        default=["Variations brutales", "Séries constantes", "Valeurs négatives"],
-        key="vt_controles",
-    )
-    col5, col6, col7, col8 = st.columns(4)
-    with col5:
-        hausse = st.number_input("Hausse signalée à partir de (%)", 10, 10000, 200, step=10, key="vt_hausse")
-    with col6:
-        baisse = st.number_input("Baisse signalée à partir de (%)", 10, 100, 80, step=5, key="vt_baisse")
-    with col7:
-        base_min = st.number_input(
-            "Valeur précédente minimale", 1, 100000, 10, step=1,
-            help="Évite de signaler des variations sur de très petits effectifs.", key="vt_base",
-        )
-    with col8:
-        nb_constant = st.number_input(
-            "Périodes identiques consécutives", 2, 24, 4, step=1, key="vt_const"
-        )
-    st.caption(
-        "⚠️ Une grande unité sur une longue période peut produire un volume important de données."
-    )
-
-    if st.button(
-        "🔎 Analyser la cohérence dans le temps",
-        type="primary",
-        disabled=not (dataset_id and orgunit_id and controles and debut <= fin),
-        key="vt_go",
-    ):
-        try:
-            with st.spinner("Extraction et analyse en cours…"):
-                data = valeurs_formulaire(
-                    url, mode, user, password, token, dataset_id, orgunit_id,
-                    debut.isoformat(), fin.isoformat(),
-                )
-                _, noms_de, _ = elements_et_formulaires(url, mode, user, password, token)
-        except Exception as e:
-            st.error(f"Extraction impossible : {e}")
-            return
-        if data.empty:
-            st.session_state["vt_result"] = {"df": None, "vide": True}
-        else:
-            anomalies = anomalies_temporelles(
-                data, controles, float(hausse), float(baisse), float(base_min), int(nb_constant)
-            )
-            if anomalies.empty:
-                st.session_state["vt_result"] = {"df": None, "vide": False}
-            else:
-                anomalies["Unité d'organisation"] = (
-                    anomalies["orgUnit"].map(noms_ou).fillna(anomalies["orgUnit"])
-                )
-                anomalies["Élément de données"] = (
-                    anomalies["dataElement"].map(noms_de).fillna(anomalies["dataElement"])
-                )
-                anomalies["Lien de saisie"] = [
-                    lien_saisie(dataset_id, o, p) for o, p in zip(anomalies["orgUnit"], anomalies["Période"])
-                ]
-                st.session_state["vt_result"] = {
-                    "df": anomalies.drop(columns=["orgUnit", "dataElement"]),
-                    "vide": False,
-                    "formulaire": noms_ds.get(dataset_id, dataset_id),
-                    "unite": noms_ou.get(orgunit_id, orgunit_id),
-                    "periode": f"{debut.isoformat()} → {fin.isoformat()}",
-                    "nb_valeurs": len(data),
-                }
-
-    res = st.session_state.get("vt_result")
-    if not res:
-        return
-    if res["df"] is None:
-        if res["vide"]:
-            st.warning("Aucune donnée trouvée pour ce formulaire, cette unité et cette période.")
-        else:
-            st.success("Aucune anomalie détectée avec ces paramètres. ✅")
-        return
-    df = res["df"]
-    st.subheader(f"{res['formulaire']} : {res['unite']} ({res['periode']})")
-    c1, c2 = st.columns(2)
-    c1.metric("Anomalies détectées", f"{len(df):,}".replace(",", " "))
-    c2.metric("Valeurs analysées", f"{res['nb_valeurs']:,}".replace(",", " "))
-    ordre = ["Unité d'organisation", "Élément de données", "Période", "Valeur",
-             "Valeur précédente", "Variation (%)", "Détail", "Lien de saisie"]
-    st.download_button(
-        "⬇️ Télécharger les anomalies (CSV)",
-        data=df[["Anomalie"] + ordre].to_csv(index=False).encode("utf-8-sig"),
-        file_name="dhis2_anomalies_temporelles.csv",
-        mime="text/csv",
-    )
-    for type_anomalie in ["Hausse brutale", "Baisse brutale", "Série constante", "Valeur négative"]:
-        sous = df[df["Anomalie"] == type_anomalie]
-        if sous.empty:
-            continue
-        sous = sous[ordre]
-        if type_anomalie in ("Hausse brutale", "Baisse brutale"):
-            sous = sous.reindex(sous["Variation (%)"].abs().sort_values(ascending=False).index)
-        else:
-            sous = sous.sort_values(["Unité d'organisation", "Élément de données", "Période"])
-        sous = sous.dropna(axis=1, how="all")
-        with st.expander(f"❌ {type_anomalie} : {len(sous)} cas", expanded=True):
-            st.dataframe(
-                sous,
-                hide_index=True,
-                use_container_width=True,
-                height=min(500, 40 + 35 * len(sous)),
-                column_config={
-                    **config_liens(),
-                    "Variation (%)": st.column_config.NumberColumn(format="%.0f %%"),
-                },
-            )
-
-
-# ------------------------------------------------------------------
-# Validation : données manquantes et silencieuses (unités qui ne déclarent pas)
-# ------------------------------------------------------------------
-PAS_MOIS = {"Monthly": 1, "Quarterly": 3, "SixMonthly": 6, "Yearly": 12}
-
-
-def periodes_attendues(type_periode, debut, fin, aujourdhui):
-    """Périodes DHIS2 entièrement écoulées entre debut et fin, sous forme (id, début, fin).
-    Renvoie None si le type de période n'est pas géré."""
-    limite = min(fin, aujourdhui)
-    res = []
-    if type_periode in PAS_MOIS:
-        n = PAS_MOIS[type_periode]
-        y, m = debut.year, debut.month
-        if debut.day > 1:
-            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-        while (m - 1) % n != 0:
-            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-        while True:
-            total = y * 12 + (m - 1) + n
-            y2, m2 = total // 12, total % 12 + 1
-            debut_p = datetime.date(y, m, 1)
-            fin_p = datetime.date(y2, m2, 1) - datetime.timedelta(days=1)
-            if fin_p > limite:
-                break
-            if type_periode == "Monthly":
-                pid = f"{y}{m:02d}"
-            elif type_periode == "Quarterly":
-                pid = f"{y}Q{(m - 1) // 3 + 1}"
-            elif type_periode == "SixMonthly":
-                pid = f"{y}S{(m - 1) // 6 + 1}"
-            else:
-                pid = f"{y}"
-            res.append((pid, debut_p, fin_p))
-            y, m = y2, m2
-        return res
-    if type_periode == "Weekly":
-        d = debut + datetime.timedelta(days=(7 - debut.weekday()) % 7)
-        while d + datetime.timedelta(days=6) <= limite:
-            iso = d.isocalendar()
-            res.append((f"{iso[0]}W{iso[1]}", d, d + datetime.timedelta(days=6)))
-            d += datetime.timedelta(days=7)
-        return res
-    return None
-
-
-def analyser_saisie(unites: pd.DataFrame, data: pd.DataFrame, ids_periodes: list):
-    """Croise unités attendues x périodes attendues avec les valeurs saisies.
-    Renvoie (grille, résumé par unité)."""
-    grille = pd.MultiIndex.from_product(
-        [unites["id"].tolist(), ids_periodes], names=["orgUnit", "Période"]
-    ).to_frame(index=False)
-    if data.empty:
-        presence = pd.DataFrame(columns=["orgUnit", "Période", "nb_valeurs", "nb_non_nuls"])
-    else:
-        v = pd.to_numeric(data["value"], errors="coerce")
-        d = data.assign(_non_nul=(v.isna() | (v != 0)).astype(int))
-        presence = (
-            d.groupby(["orgUnit", "period"])
-            .agg(nb_valeurs=("value", "size"), nb_non_nuls=("_non_nul", "sum"))
-            .reset_index()
-            .rename(columns={"period": "Période"})
-        )
-    grille = grille.merge(presence, on=["orgUnit", "Période"], how="left")
-    grille["saisi"] = grille["nb_valeurs"].notna()
-    grille["nb_non_nuls"] = grille["nb_non_nuls"].fillna(0)
-    grille["rang"] = grille["Période"].map({p: i for i, p in enumerate(ids_periodes)})
-    historique = grille.groupby("orgUnit")["nb_non_nuls"].transform("max") > 0
-    grille["a_zero"] = grille["saisi"] & (grille["nb_non_nuls"] == 0) & historique
-
-    n = len(ids_periodes)
-    lignes = []
-    for ou, g in grille.sort_values("rang").groupby("orgUnit", sort=False):
-        saisi = g["saisi"].tolist()
-        retard = 0
-        for ok in reversed(saisi):
-            if ok:
-                break
-            retard += 1
-        saisies = [p for p, ok in zip(g["Période"], saisi) if ok]
-        lignes.append(
-            {
-                "orgUnit": ou,
-                "attendus": n,
-                "saisis": len(saisies),
-                "manquants": n - len(saisies),
-                "derniere_saisie": saisies[-1] if saisies else "Jamais",
-                "retard": retard,
-                "premiere_manquante": ids_periodes[n - retard] if retard else "",
-            }
-        )
-    resume = pd.DataFrame(lignes)
-    return grille, resume
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def type_periode_formulaire(url, mode, user, password, token, dataset) -> str:
-    s = make_session(mode, user, password, token)
-    r = s.get(f"{url}/dataSets/{dataset}.json", params={"fields": "periodType"}, timeout=120)
-    r.raise_for_status()
-    return r.json().get("periodType", "")
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def unites_attendues(url, mode, user, password, token, dataset, orgunit) -> pd.DataFrame:
-    """Unités (l'unité choisie et ses descendantes) auxquelles le formulaire est affecté."""
-    s = make_session(mode, user, password, token)
-    r = s.get(
-        f"{url}/organisationUnits.json",
-        params={
-            "fields": "id,displayName,ancestors[displayName]",
-            "paging": "false",
-            "filter": [f"path:like:{orgunit}", f"dataSets.id:eq:{dataset}"],
-        },
-        timeout=300,
-    )
-    r.raise_for_status()
-    lignes = [
-        {
-            "id": u["id"],
-            "Unité d'organisation": u.get("displayName", u["id"]),
-            "Hiérarchie": " / ".join(a.get("displayName", "") for a in u.get("ancestors", [])),
-        }
-        for u in r.json().get("organisationUnits", [])
-    ]
-    return pd.DataFrame(lignes, columns=["id", "Unité d'organisation", "Hiérarchie"])
-
-
-def section_manquantes():
-    st.caption(
-        "Les règles de validation ne se déclenchent pas quand une valeur est absente : une unité "
-        "qui ne déclare rien ne génère donc aucune erreur. Cette section croise les unités auxquelles "
-        "le formulaire est affecté avec les valeurs réellement saisies, pour repérer les unités "
-        "silencieuses, les retards de saisie et les formulaires entièrement à zéro."
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        dataset_id = st.selectbox(
-            "Formulaire",
-            options=df_ds["id"].tolist(),
-            format_func=lambda i: noms_ds.get(i, i),
-            key="mq_ds",
-        )
-    with col2:
-        orgunit_id = choisir_unite("mq")
-    col3, col4, col5 = st.columns(3)
-    aujourdhui = datetime.date.today()
-    with col3:
-        debut = st.date_input(
-            "Début", value=datetime.date(aujourdhui.year - 1, aujourdhui.month, 1), key="mq_debut"
-        )
-    with col4:
-        fin = st.date_input("Fin", value=aujourdhui, key="mq_fin")
-    with col5:
-        seuil_retard = st.number_input(
-            "Retard signalé à partir de (périodes consécutives manquantes)",
-            1, 60, 2, step=1, key="mq_retard",
-        )
-    st.caption(
-        "Seules les périodes entièrement écoulées sont analysées. "
-        "⚠️ Une grande unité sur une longue période peut produire un volume important de données."
-    )
-
-    if st.button(
-        "🔎 Détecter les données manquantes",
-        type="primary",
-        disabled=not (dataset_id and orgunit_id and debut <= fin),
-        key="mq_go",
-    ):
-        try:
-            with st.spinner("Extraction et analyse en cours…"):
-                type_p = type_periode_formulaire(url, mode, user, password, token, dataset_id)
-                periodes = periodes_attendues(type_p, debut, fin, aujourdhui)
-                if periodes is None:
-                    st.session_state["mq_result"] = {"erreur": f"Type de période non géré : {type_p}."}
-                    return
-                if not periodes:
-                    st.session_state["mq_result"] = {
-                        "erreur": "Aucune période entièrement écoulée dans l'intervalle choisi."
-                    }
-                    return
-                unites = unites_attendues(url, mode, user, password, token, dataset_id, orgunit_id)
-                if unites.empty:
-                    st.session_state["mq_result"] = {
-                        "erreur": "Ce formulaire n'est affecté à aucune unité sous l'unité choisie."
-                    }
-                    return
-                data = valeurs_formulaire(
-                    url, mode, user, password, token, dataset_id, orgunit_id,
-                    debut.isoformat(), fin.isoformat(),
-                )
-        except Exception as e:
-            st.error(f"Extraction impossible : {e}")
-            return
-        ids_p = [p[0] for p in periodes]
-        grille, resume = analyser_saisie(unites, data, ids_p)
-        infos = unites.set_index("id")
-        resume["Unité d'organisation"] = resume["orgUnit"].map(infos["Unité d'organisation"])
-        resume["Hiérarchie"] = resume["orgUnit"].map(infos["Hiérarchie"])
-        resume["Taux de saisie (%)"] = (100 * resume["saisis"] / resume["attendus"]).round(0)
-        resume["Lien de saisie"] = [
-            lien_saisie(dataset_id, o, p) for o, p in zip(resume["orgUnit"], resume["premiere_manquante"])
-        ]
-        manquants = grille[~grille["saisi"]].copy()
-        zeros = grille[grille["a_zero"]].copy()
-        for t in (manquants, zeros):
-            t["Unité d'organisation"] = t["orgUnit"].map(infos["Unité d'organisation"])
-            t["Hiérarchie"] = t["orgUnit"].map(infos["Hiérarchie"])
-            t["Lien de saisie"] = [lien_saisie(dataset_id, o, p) for o, p in zip(t["orgUnit"], t["Période"])]
-        st.session_state["mq_result"] = {
-            "formulaire": noms_ds.get(dataset_id, dataset_id),
-            "unite": noms_ou.get(orgunit_id, orgunit_id),
-            "type_periode": type_p,
-            "periodes": f"{ids_p[0]} → {ids_p[-1]} ({len(ids_p)})",
-            "resume": resume,
-            "manquants": manquants,
-            "zeros": zeros,
-            "seuil": int(seuil_retard),
-        }
-
-    res = st.session_state.get("mq_result")
-    if not res:
-        return
-    if "erreur" in res:
-        st.warning(res["erreur"])
-        return
-    resume, manquants, zeros = res["resume"], res["manquants"], res["zeros"]
-    attendus, saisis = int(resume["attendus"].sum()), int(resume["saisis"].sum())
-    silencieuses = resume[resume["saisis"] == 0]
-    en_retard = resume[(resume["saisis"] > 0) & (resume["retard"] >= res["seuil"])]
-    st.subheader(f"{res['formulaire']} : {res['unite']}")
-    st.caption(f"Période {res['type_periode']} : {res['periodes']}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Unités attendues", f"{len(resume):,}".replace(",", " "))
-    c2.metric("Taux de saisie", f"{100 * saisis / attendus:.0f} %" if attendus else "n/a")
-    c3.metric("Unités silencieuses", f"{len(silencieuses):,}".replace(",", " "))
-    c4.metric("Unités en retard", f"{len(en_retard):,}".replace(",", " "))
-
-    colonnes = ["Unité d'organisation", "Hiérarchie", "attendus", "saisis", "manquants",
-                "Taux de saisie (%)", "derniere_saisie", "retard", "Lien de saisie"]
-    renommer = {"attendus": "Périodes attendues", "saisis": "Périodes saisies",
-                "manquants": "Périodes manquantes", "derniere_saisie": "Dernière période saisie",
-                "retard": "Retard (périodes)"}
-    config = {**config_liens(), "Taux de saisie (%)": st.column_config.NumberColumn(format="%.0f %%")}
-    st.download_button(
-        "⬇️ Télécharger le résumé par unité (CSV)",
-        data=resume[colonnes].rename(columns=renommer)
-        .sort_values("Périodes manquantes", ascending=False)
-        .to_csv(index=False).encode("utf-8-sig"),
-        file_name="dhis2_saisie_par_unite.csv",
-        mime="text/csv",
-    )
-
-    def tableau(titre, df, cols, tri, ouvert=True, ico="❌", plafond=5000, croissant=True):
-        if df.empty:
-            st.success(f"✅ {titre} : aucun cas.")
-            return
-        sous = df[cols].sort_values(tri, ascending=croissant).rename(columns=renommer)
-        with st.expander(f"{ico} {titre} : {len(df)} cas", expanded=ouvert):
-            if len(sous) > plafond:
-                st.warning(f"Affichage limité aux {plafond} premières lignes : téléchargez le CSV pour tout voir.")
-            st.dataframe(
-                sous.head(plafond),
-                hide_index=True,
-                use_container_width=True,
-                height=min(500, 40 + 35 * min(len(sous), plafond)),
-                column_config=config,
-            )
-
-    tableau("Unités silencieuses (aucune saisie sur la période)", silencieuses, colonnes,
-            ["Hiérarchie", "Unité d'organisation"], ico="🔇")
-    tableau(f"Retard de saisie (au moins {res['seuil']} périodes consécutives manquantes)", en_retard,
-            colonnes, ["retard"], ico="⏳", croissant=False)
-    tableau("Formulaires entièrement à zéro (unité ayant déjà saisi des valeurs non nulles)", zeros,
-            ["Unité d'organisation", "Hiérarchie", "Période", "Lien de saisie"],
-            ["Unité d'organisation", "Période"], ouvert=False, ico="⚠️")
-    tableau("Détail des périodes non saisies", manquants,
-            ["Unité d'organisation", "Hiérarchie", "Période", "Lien de saisie"],
-            ["Unité d'organisation", "Période"], ouvert=False, ico="📭")
-
-
-def onglet_validation():
-    sous_regles, sous_aberrantes, sous_variations, sous_manquantes = st.tabs(
-        ["📋 Règles de validation", "📈 Valeurs aberrantes", "⏱️ Variations dans le temps",
-         "📭 Données manquantes"]
-    )
-    with sous_regles:
-        section_regles()
-    with sous_aberrantes:
-        section_aberrantes()
-    with sous_variations:
-        section_variations()
-    with sous_manquantes:
-        section_manquantes()
-
-
-tab_ext, tab_comp, tab_qd = st.tabs(["📥 Extraction", "✅ Complétude", "🔍 Validation"])
+tab_ext, tab_comp, tab_qd = st.tabs(["📥 Extraction", "✅ Complétude", "🔍 Qualité des données"])
 with tab_ext:
     onglet_extraction()
 with tab_comp:
     onglet_completude()
 with tab_qd:
-    onglet_validation()
+    onglet_qualite()
