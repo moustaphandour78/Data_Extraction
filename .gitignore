@@ -1,0 +1,22 @@
+# --- Secrets (ne jamais versionner) ---
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# --- Données extraites de DHIS2 ---
+sortie/
+*.csv
+*.duckdb
+*.parquet
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Divers ---
+.DS_Store
+.idea/
+.vscode/
