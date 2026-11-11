@@ -1,9 +1,9 @@
 """
-V4
 Application Streamlit : extraction de données DHIS2
 (un formulaire x une unité d'organisation x N dernières années)
-Quatre onglets indépendants : « Extraction », « Complétude », « Qualité des données » et
-« Validation » (consignes de validation 2020 appliquées aux tableaux du tableau de bord).
+Cinq onglets indépendants : « Extraction », « Complétude », « Qualité des données »,
+« Validation » (consignes de validation 2020 appliquées aux tableaux du tableau de bord) et
+« Tracker » (indicateurs de programme agrégés, une ou plusieurs instances ; voir .env.example).
 Les données extraites sont agrégées par année : pour chaque élément de données, on cumule
 toutes les combinaisons de catégories (categoryOptionCombo).
 
@@ -17,10 +17,12 @@ Identifiants : fichier .env placé à côté de ce script (voir .env.example)
     DHIS2_TOKEN=d2pat_...
 """
 import datetime
+import json
 import math
 import os
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -2477,8 +2479,936 @@ def onglet_validation():
                     st.info("Aucune consigne appliquée.")
 
 
-tab_ext, tab_comp, tab_qd, tab_val = st.tabs(
-    ["📥 Extraction", "✅ Complétude", "🔍 Qualité des données", "🧪 Validation"]
+# ------------------------------------------------------------------
+# Onglet 5 : tracker (indicateurs de programme, une ou plusieurs instances)
+# ------------------------------------------------------------------
+# Seules des valeurs AGRÉGÉES sont récupérées (API analytics) : aucune donnée individuelle
+# (personne suivie, événement) n'est lue ni affichée.
+EXEMPLE_ENV = """TRACKER_USER=lecture_tracker
+TRACKER_INSTANCES=SURVEILLANCE
+TRACKER_SURVEILLANCE_NOM=Surveillance
+TRACKER_SURVEILLANCE_URL=https://minsante.sec.gouv.sn/surveillance/api
+TRACKER_SURVEILLANCE_PASSWORD=mot_de_passe_de_cette_instance"""
+
+
+def normaliser_url_api(u: str) -> str:
+    """Ajoute /api à l'URL d'une instance si nécessaire."""
+    u = (u or "").strip().rstrip("/")
+    if not u:
+        return ""
+    return u if re.search(r"/api(/\d+)?$", u) else u + "/api"
+
+
+def instances_tracker() -> dict:
+    """Instances tracker déclarées dans le .env (TRACKER_INSTANCES=A,B,…)."""
+    sortie = {}
+    for brut in secret("TRACKER_INSTANCES", "").split(","):
+        iid = brut.strip()
+        if not iid:
+            continue
+        cle = re.sub(r"[^A-Za-z0-9]+", "_", iid).upper()
+        sortie[iid] = {
+            "id": iid,
+            "nom": secret(f"TRACKER_{cle}_NOM", iid) or iid,
+            "url": normaliser_url_api(secret(f"TRACKER_{cle}_URL")),
+            "user": secret(f"TRACKER_{cle}_USER") or secret("TRACKER_USER"),
+            "password": secret(f"TRACKER_{cle}_PASSWORD"),
+        }
+    return sortie
+
+
+def session_tracker(cfg: dict) -> requests.Session:
+    s = requests.Session()
+    s.auth = (cfg["user"], cfg["password"])
+    s.headers["Accept"] = "application/json"
+    return s
+
+
+def erreur_http(e: Exception) -> str:
+    rep = getattr(e, "response", None)
+    if rep is not None:
+        try:
+            msg = rep.json().get("message")
+        except Exception:
+            msg = None
+        return f"HTTP {rep.status_code}" + (f" : {msg}" if msg else "")
+    return str(e)
+
+
+def tester_instance(cfg: dict) -> dict:
+    """Test de connexion : compte reconnu, version de DHIS2."""
+    ligne = {"Instance": cfg["nom"], "URL": cfg["url"], "Statut": "", "Compte": "",
+             "Version DHIS2": "", "Message": ""}
+    if not cfg["url"]:
+        ligne["Statut"] = "❌ URL manquante"
+        return ligne
+    if not (cfg["user"] and cfg["password"]):
+        ligne["Statut"] = "❌ Identifiants manquants"
+        ligne["Message"] = "Renseignez l'utilisateur et le mot de passe dans le .env."
+        return ligne
+    try:
+        s = session_tracker(cfg)
+        r = s.get(f"{cfg['url']}/me.json", params={"fields": "username"}, timeout=30)
+        if r.status_code == 401:
+            ligne["Statut"] = "❌ Identifiants refusés"
+            ligne["Message"] = "Utilisateur ou mot de passe incorrect pour cette instance."
+            return ligne
+        r.raise_for_status()
+        try:
+            ligne["Compte"] = r.json().get("username", "")
+        except ValueError:
+            ligne["Statut"] = "❌ Réponse inattendue"
+            ligne["Message"] = "L'URL de l'API est probablement incorrecte."
+            return ligne
+        ligne["Statut"] = "✅ Connecté"
+        try:
+            ri = s.get(f"{cfg['url']}/system/info.json", params={"fields": "version"}, timeout=30)
+            ligne["Version DHIS2"] = ri.json().get("version", "")
+        except Exception:
+            pass
+    except requests.exceptions.RequestException as e:
+        ligne["Statut"] = "❌ Échec de connexion"
+        ligne["Message"] = erreur_http(e)
+    return ligne
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def meta_instance(inst_id: str) -> dict:
+    """Unités assignées au compte et niveaux hiérarchiques d'une instance."""
+    cfg = instances_tracker()[inst_id]
+    s = session_tracker(cfg)
+    r = s.get(
+        f"{cfg['url']}/me.json",
+        params={"fields": "dataViewOrganisationUnits[id,displayName,level],"
+                          "organisationUnits[id,displayName,level]"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    j = r.json()
+    racines = j.get("dataViewOrganisationUnits") or j.get("organisationUnits") or []
+    if not racines:
+        rr = s.get(f"{cfg['url']}/organisationUnits.json",
+                   params={"fields": "id,displayName,level", "filter": "level:eq:1", "paging": "false"},
+                   timeout=60)
+        rr.raise_for_status()
+        racines = rr.json().get("organisationUnits", [])
+    rl = s.get(f"{cfg['url']}/organisationUnitLevels.json",
+               params={"fields": "level,displayName", "paging": "false", "order": "level:asc"}, timeout=60)
+    rl.raise_for_status()
+    niveaux = {int(x["level"]): x["displayName"] for x in rl.json().get("organisationUnitLevels", [])}
+    return {"racines": racines, "niveaux": niveaux}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def noms_indicateurs_instance(inst_id: str, uids: tuple) -> dict:
+    cfg = instances_tracker()[inst_id]
+    r = session_tracker(cfg).get(
+        f"{cfg['url']}/programIndicators.json",
+        params={"fields": "id,displayName", "filter": f"id:in:[{','.join(uids)}]", "paging": "false"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return {x["id"]: x["displayName"] for x in r.json().get("programIndicators", [])}
+
+
+def charger_catalogue_tracker() -> pd.DataFrame:
+    """Catalogue des indicateurs (tracker_indicateurs.csv) : colonnes instance, uid, indicateur
+    (nom commun, facultatif : il permet de rapprocher des indicateurs d'identifiants différents)."""
+    colonnes = ["instance", "uid", "indicateur", "cle"]
+    chemin = Path(secret("TRACKER_CATALOGUE", "") or Path(__file__).parent / "tracker_indicateurs.csv")
+    if not chemin.exists():
+        return pd.DataFrame(columns=colonnes)
+    df = pd.read_csv(chemin, sep=None, engine="python", dtype=str).fillna("")
+    df.columns = [c.strip().lower() for c in df.columns]
+    for c in ("instance", "uid", "indicateur"):
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].str.strip()
+    df = df[df["uid"] != ""].copy()
+    df["cle"] = df["indicateur"].where(df["indicateur"] != "", df["uid"])
+    return df[colonnes].reset_index(drop=True)
+
+
+def construire_periodes(annees: list, granularite: str) -> list:
+    """Périodes DHIS2 (2026, 2026Q1, 202601, 2026W1) déjà commencées."""
+    auj, sortie = datetime.date.today(), []
+    for a in sorted(annees):
+        if granularite == "Année":
+            if a <= auj.year:
+                sortie.append(str(a))
+        elif granularite == "Semaine":
+            nb = datetime.date(a, 12, 28).isocalendar()[1]  # nombre de semaines ISO de l'année
+            sortie += [f"{a}W{w}" for w in range(1, nb + 1) if datetime.date.fromisocalendar(a, w, 1) <= auj]
+        elif granularite == "Trimestre":
+            sortie += [f"{a}Q{q}" for q in range(1, 5) if datetime.date(a, 3 * q - 2, 1) <= auj]
+        else:
+            sortie += [f"{a}{m:02d}" for m in range(1, 13) if datetime.date(a, m, 1) <= auj]
+    return sortie
+
+
+COLONNES_TRACKER = ["Instance", "uid", "Indicateur", "Période", "ou", "Unité", "Valeur"]
+
+
+def requete_indicateurs(cfg: dict, meta: dict, uids: tuple, periodes: tuple, niveau: int) -> pd.DataFrame:
+    """Valeurs agrégées des indicateurs de programme (analytics) pour un niveau hiérarchique."""
+    s = session_tracker(cfg)
+    morceaux, niveau_min = [], None
+    for racine in meta["racines"]:
+        niv_r = int(racine.get("level", 1))
+        niveau_min = niv_r if niveau_min is None else min(niveau_min, niv_r)
+        if niveau < niv_r:
+            continue
+        ou = racine["id"] if niveau == niv_r else f"LEVEL-{niveau};{racine['id']}"
+        r = s.get(
+            f"{cfg['url']}/analytics.json",
+            params={
+                "dimension": [f"dx:{';'.join(uids)}", f"pe:{';'.join(periodes)}", f"ou:{ou}"],
+                "skipMeta": "false",
+                "displayProperty": "NAME",
+            },
+            timeout=600,
+        )
+        r.raise_for_status()
+        rep = r.json()
+        df = pd.DataFrame(rep.get("rows", []), columns=[h["name"] for h in rep["headers"]])
+        if df.empty:
+            continue
+        items = (rep.get("metaData", {}) or {}).get("items", {}) or {}
+        nom = lambda i: (items.get(i) or {}).get("name", i)
+        morceaux.append(
+            pd.DataFrame(
+                {
+                    "Instance": cfg["nom"],
+                    "uid": df["dx"],
+                    "Indicateur": df["dx"].map(nom),
+                    "Période": df["pe"],
+                    "ou": df["ou"],
+                    "Unité": df["ou"].map(nom),
+                    "Valeur": pd.to_numeric(df["value"], errors="coerce"),
+                }
+            )
+        )
+    if niveau_min is not None and niveau < niveau_min and not morceaux:
+        raise ValueError(
+            f"Le niveau {niveau} est au-dessus de l'unité assignée au compte (niveau {niveau_min})."
+        )
+    return pd.concat(morceaux, ignore_index=True) if morceaux else pd.DataFrame(columns=COLONNES_TRACKER)
+
+
+def interroger_instances(selection: list, instances: dict, catalogue: pd.DataFrame, cles: list,
+                         periodes: list, niveau: int) -> tuple:
+    """Interroge les instances en parallèle. Renvoie (données au niveau choisi, total de l'unité
+    assignée, erreurs, indicateurs sans donnée). Le total est calculé par DHIS2 lui-même : il reste
+    exact pour les taux et ratios, contrairement à une somme des unités."""
+    metas, erreurs = {}, []
+    for iid in selection:  # métadonnées (en cache) lues dans le fil principal
+        try:
+            metas[iid] = meta_instance(iid)
+        except Exception as e:
+            erreurs.append(f"{instances[iid]['nom']} : {erreur_http(e)}")
+
+    def travail(iid):
+        uids = tuple(catalogue.loc[(catalogue["instance"] == iid) & (catalogue["cle"].isin(cles)), "uid"])
+        if not uids:
+            return iid, None, None, "aucun des indicateurs choisis n'est défini pour cette instance."
+        try:
+            cfg, meta = instances[iid], metas[iid]
+            df = requete_indicateurs(cfg, meta, uids, tuple(periodes), niveau)
+            niv_total = min(int(r.get("level", 1)) for r in meta["racines"])
+            try:
+                total = df if niveau == niv_total else requete_indicateurs(cfg, meta, uids, tuple(periodes), niv_total)
+            except Exception:
+                total = pd.DataFrame(columns=COLONNES_TRACKER)
+            return iid, df, total, None
+        except Exception as e:
+            return iid, None, None, erreur_http(e)
+
+    actifs = [i for i in selection if i in metas]
+    resultats = []
+    if actifs:
+        with ThreadPoolExecutor(max_workers=min(4, len(actifs))) as ex:
+            resultats = list(ex.map(travail, actifs))
+    morceaux, totaux, sans_donnee = [], [], []
+    for iid, df, total, err in resultats:
+        if err:
+            erreurs.append(f"{instances[iid]['nom']} : {err}")
+            continue
+        morceaux.append(df)
+        totaux.append(total)
+        attendus = set(catalogue.loc[(catalogue["instance"] == iid) & (catalogue["cle"].isin(cles)), "uid"])
+        sans_donnee += [f"{instances[iid]['nom']} : {u}" for u in sorted(attendus - set(df["uid"]))]
+    vide = pd.DataFrame(columns=COLONNES_TRACKER)
+    data = pd.concat(morceaux, ignore_index=True) if morceaux else vide
+    total = pd.concat(totaux, ignore_index=True) if totaux else vide
+    return data, total, erreurs, sans_donnee
+
+
+def appliquer_noms_communs(df: pd.DataFrame, catalogue: pd.DataFrame) -> pd.DataFrame:
+    """Remplace le nom d'un indicateur par son nom commun du catalogue (s'il existe)."""
+    if df.empty:
+        return df
+    commun = dict(zip(catalogue["uid"], catalogue["cle"]))
+    df = df.copy()
+    df["Indicateur"] = [
+        (commun[u] if commun.get(u) and commun[u] != u else n) for u, n in zip(df["uid"], df["Indicateur"])
+    ]
+    return df
+
+
+MOIS_FR = ["Jan", "Fév", "Mar", "Avr", "Mai", "Juin", "Juil", "Aoû", "Sep", "Oct", "Nov", "Déc"]
+
+
+def position_periode(pe: str, gran: str):
+    """(position dans l'année, repère affiché) : 202603 -> (3, 'Mar') ; 2026Q2 -> (2, 'T2') ; 2026W5 -> (5, 'S5')."""
+    try:
+        if gran == "Mois":
+            m = int(pe[4:6])
+            return m, MOIS_FR[m - 1]
+        if gran == "Trimestre":
+            q = int(pe.split("Q")[1])
+            return q, f"T{q}"
+        if gran == "Semaine":
+            w = int(pe.split("W")[1])
+            return w, f"S{w}"
+    except (ValueError, IndexError):
+        pass
+    return None, None
+
+
+def axe_position(gran: str):
+    """Axe horizontal quantitatif (position dans l'année) avec libellés lisibles."""
+    import altair as alt
+
+    if gran == "Mois":
+        expr = f"datum.value >= 1 && datum.value <= 12 ? {json.dumps(MOIS_FR, ensure_ascii=False)}[datum.value - 1] : ''"
+    elif gran == "Trimestre":
+        expr = "'T' + datum.value"
+    else:
+        expr = "'S' + datum.value"
+    return alt.Axis(labelExpr=expr, tickMinStep=1, labelAngle=0, title=None)
+
+
+def cle_periode(pe: str) -> tuple:
+    """Clé de tri chronologique : 2026W9 avant 2026W46 (le tri alphabétique les inverserait)."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(pe)))
+
+
+def periode_an_precedent(pe: str) -> str:
+    """Même période l'année précédente : 202611 -> 202511 ; 2026Q4 -> 2025Q4 ; 2026W46 -> 2025W46."""
+    return str(int(pe[:4]) - 1) + pe[4:]
+
+
+def preparer_series(data: pd.DataFrame, total: pd.DataFrame, gran: str, positions: bool = True) -> pd.DataFrame:
+    """Séries (indicateur × unité × période) avec année, position dans l'année et repère affichable.
+    Le total de l'unité assignée est ajouté comme une unité « Total · … »."""
+    ensemble = pd.concat([data, total]) if not total.empty else data
+    plusieurs = ensemble["Instance"].nunique() > 1
+    suffixe = lambda df: (" (" + df["Instance"] + ")") if plusieurs else ""
+    morceaux = [data.assign(Libellé=data["Unité"] + suffixe(data))]
+    if not total.empty:
+        morceaux.insert(0, total.assign(Libellé="Total · " + total["Unité"] + suffixe(total)))
+    tous = pd.concat(morceaux, ignore_index=True)
+    tous = tous.drop_duplicates(subset=["Indicateur", "Instance", "Libellé", "Période"])
+    tous["Année"] = tous["Période"].str[:4]
+    if positions:
+        pos = tous["Période"].map(lambda p: position_periode(p, gran))
+        tous["Position"] = [p[0] for p in pos]
+        tous["Repère"] = [p[1] for p in pos]
+        tous = tous.dropna(subset=["Position"])
+    return tous
+
+
+def selection_serie(tous: pd.DataFrame, prefixe: str) -> tuple:
+    """Choix d'un indicateur et d'une unité (ou du total) : renvoie (série, indicateur, unité)."""
+    g1, g2 = st.columns(2)
+    with g1:
+        ind = st.selectbox("Indicateur", sorted(tous["Indicateur"].unique()), key=f"{prefixe}_ind")
+    sous = tous[tous["Indicateur"] == ind]
+    libelles = sorted(sous["Libellé"].unique(), key=lambda x: (not x.startswith("Total"), x))
+    with g2:
+        unite = st.selectbox("Unité", libelles, key=f"{prefixe}_unite_{ind}")
+    return sous[sous["Libellé"] == unite].copy(), ind, unite
+
+
+def courbes_annees(data: pd.DataFrame, total: pd.DataFrame, gran: str, cumul: bool = False):
+    """Courbes superposées (une par année) sur le même axe ; avec cumul=True, cumul annuel."""
+    import altair as alt
+
+    prefixe = "tr_cum" if cumul else "tr_yoy"
+    if cumul:
+        st.caption("Somme cumulée depuis le début de chaque année. À réserver aux effectifs (comptages), "
+                   "pas aux taux ni aux pourcentages.")
+    if gran == "Année":
+        st.info("Choisissez la granularité Mois, Trimestre ou Semaine pour superposer les années.")
+        return
+    tous = preparer_series(data, total, gran)
+    if tous.empty:
+        st.info("Aucune valeur exploitable.")
+        return
+    sous, ind, unite = selection_serie(tous, prefixe)
+    annees = sorted(sous["Année"].unique())
+    choix = st.multiselect("Années", annees, default=annees[-2:], key=f"{prefixe}_annees_{ind}_{unite}")
+    sous = sous[sous["Année"].isin(choix)].sort_values(["Année", "Position"])
+    if sous.empty:
+        st.info("Aucune valeur pour cette sélection.")
+        return
+    if cumul:
+        sous["Valeur"] = sous.groupby("Année")["Valeur"].cumsum()
+
+    palette = ["#9aa5b1", "#2E5C8A", "#f39c12", "#27ae60", "#8e44ad"]
+    ordre = sorted(choix)
+    couleurs = [palette[i % len(palette)] for i in range(len(ordre) - 1)] + ["#d73027"]  # année la plus récente en rouge
+    reperes = sous.sort_values("Position")["Repère"].drop_duplicates().tolist()
+    graphe = (
+        alt.Chart(sous)
+        .mark_line(point=True, strokeWidth=2.5)
+        .encode(
+            x=alt.X("Repère:N", sort=reperes, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Valeur:Q", title=None),
+            color=alt.Color("Année:N", scale=alt.Scale(domain=ordre, range=couleurs), legend=alt.Legend(title="Année")),
+            tooltip=["Année", "Repère", "Valeur"],
+        )
+        .properties(height=340)
+    )
+    st.altair_chart(graphe, use_container_width=True)
+
+    recent = sous[(sous["Année"] == ordre[-1]) & sous["Valeur"].notna()]
+    if len(ordre) >= 2 and not recent.empty:
+        dernier = recent.sort_values("Position").iloc[-1]
+        prec = sous[(sous["Année"] == ordre[-2]) & (sous["Position"] == dernier["Position"])]["Valeur"]
+        delta = None
+        if not prec.empty and pd.notna(prec.iloc[0]) and prec.iloc[0] != 0:
+            delta = f"{(dernier['Valeur'] - prec.iloc[0]) / prec.iloc[0] * 100:+.1f} % vs {ordre[-2]}"
+        st.metric(f"{'Cumul à ' if cumul else ''}{dernier['Repère']} {ordre[-1]}", fmt_nombre(dernier["Valeur"]), delta=delta)
+
+
+def canal_endemique(data: pd.DataFrame, total: pd.DataFrame, gran: str):
+    """Année suivie comparée aux quartiles des années de référence, période par période."""
+    import altair as alt
+
+    st.caption(
+        "Compare l'année suivie à la médiane et aux quartiles des années précédentes, période par période. "
+        "Au-dessus du 3e quartile : zone d'épidémie. À réserver aux effectifs (comptages), pas aux taux."
+    )
+    if gran == "Année":
+        st.info("Choisissez la granularité Mois, Trimestre ou Semaine.")
+        return
+    tous = preparer_series(data, total, gran)
+    if tous.empty:
+        st.info("Aucune valeur exploitable.")
+        return
+    sous, ind, unite = selection_serie(tous, "tr_can")
+    annees = sorted(sous["Année"].unique())
+    if len(annees) < 4:
+        st.info("Il faut au moins 3 années précédentes en plus de l'année suivie : sélectionnez davantage "
+                "d'années (jusqu'à 5 ans) puis rechargez les indicateurs.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        courante = st.selectbox("Année suivie", annees, index=len(annees) - 1, key=f"tr_can_an_{ind}_{unite}")
+    precedentes = [a for a in annees if a < courante]
+    with c2:
+        ref = st.multiselect("Années de référence", precedentes, default=precedentes[-5:],
+                             key=f"tr_can_ref_{ind}_{unite}_{courante}")
+    if len(ref) < 3:
+        st.info("Sélectionnez au moins 3 années de référence.")
+        return
+    hist = sous[sous["Année"].isin(ref)]
+    stats = (
+        hist.groupby("Position")["Valeur"]
+        .agg(q1=lambda x: x.quantile(0.25), med="median", q3=lambda x: x.quantile(0.75), n="count")
+        .reset_index()
+    )
+    stats = stats[stats["n"] >= 3]
+    suivi = sous[sous["Année"] == courante].sort_values("Position")
+    if stats.empty:
+        st.info("Pas assez de valeurs dans les années de référence.")
+        return
+    max_suivi = suivi["Valeur"].max() if suivi["Valeur"].notna().any() else 0
+    haut = max(stats["q3"].max(), max_suivi) * 1.15 or 1
+    zones = [("Succès", "#a8d5a2"), ("Sécurité", "#fff3a8"), ("Alerte", "#f6b26b"), ("Épidémie", "#e06666")]
+    lignes = []
+    for r in stats.itertuples():
+        lignes += [("Succès", r.Position, 0, r.q1), ("Sécurité", r.Position, r.q1, r.med),
+                   ("Alerte", r.Position, r.med, r.q3), ("Épidémie", r.Position, r.q3, haut)]
+    bandes = pd.DataFrame(lignes, columns=["Zone", "Position", "bas", "haut"])
+    axe = axe_position(gran)
+    fond = (
+        alt.Chart(bandes).mark_area(opacity=0.95)
+        .encode(
+            x=alt.X("Position:Q", axis=axe),
+            y=alt.Y("haut:Q", stack=None, title=None),
+            y2="bas:Q",
+            color=alt.Color("Zone:N", scale=alt.Scale(domain=[z[0] for z in zones], range=[z[1] for z in zones]),
+                            legend=alt.Legend(title=None, orient="bottom")),
+        )
+    )
+    courbe = (
+        alt.Chart(suivi).mark_line(color="black", strokeWidth=2.5, point=True)
+        .encode(x=alt.X("Position:Q", axis=axe), y=alt.Y("Valeur:Q"), tooltip=["Repère", "Valeur"])
+    )
+    st.altair_chart((fond + courbe).properties(height=360), use_container_width=True)
+
+    m = suivi.merge(stats[["Position", "med", "q3"]], on="Position")
+    epidemie = m[m["Valeur"] > m["q3"]]
+    alerte = m[(m["Valeur"] > m["med"]) & (m["Valeur"] <= m["q3"])]
+    k1, k2 = st.columns(2)
+    k1.metric("Périodes en zone d'épidémie", len(epidemie), help="Valeur au-dessus du 3e quartile des années de référence.")
+    k2.metric("Périodes en zone d'alerte", len(alerte), help="Valeur entre la médiane et le 3e quartile.")
+    if not epidemie.empty:
+        st.warning("Au-dessus du seuil d'épidémie : " + ", ".join(epidemie["Repère"].astype(str)))
+
+
+def vue_carte(features: list) -> tuple:
+    pts = [pt for f in features for pt in _points(f["geometry"]["coordinates"])]
+    lons, lats = [p[0] for p in pts], [p[1] for p in pts]
+    centre = {"lon": (min(lons) + max(lons)) / 2, "lat": (min(lats) + max(lats)) / 2}
+    etendue = max(max(lons) - min(lons), (max(lats) - min(lats)) * 1.5, 0.01)
+    return centre, max(1.0, min(12.0, math.log2(450 / (etendue * 1.15))))
+
+
+def construire_carte_valeurs(df_map: pd.DataFrame, features: list, etiquettes: bool = True):
+    """Carte choroplèthe d'une valeur (dégradé), avec étiquettes nom + valeur."""
+    import plotly.express as px
+
+    centre, zoom = vue_carte(features)
+    args = dict(
+        geojson={"type": "FeatureCollection", "features": features},
+        locations="id", featureidkey="properties.id", color="Valeur",
+        color_continuous_scale="YlOrRd", hover_name="Unité", hover_data={"id": False, "Valeur": ":,.2f"},
+        center=centre, zoom=zoom, opacity=0.8,
+    )
+    if hasattr(px, "choropleth_map"):
+        fig = px.choropleth_map(df_map, map_style="carto-positron", **args)
+    else:
+        fig = px.choropleth_mapbox(df_map, mapbox_style="carto-positron", **args)
+    if etiquettes:
+        import plotly.graph_objects as go
+
+        infos = df_map.set_index("id")
+        lon, lat, texte = [], [], []
+        for f in features:
+            uid = f["properties"]["id"]
+            if uid not in infos.index:
+                continue
+            c = _centre_geometrie(f["geometry"])
+            if c is None:
+                continue
+            lon.append(c[0]); lat.append(c[1])
+            texte.append(f"{infos.at[uid, 'Unité']}<br><b>{fmt_nombre(infos.at[uid, 'Valeur'])}</b>")
+        trace = dict(lon=lon, lat=lat, text=texte, mode="text", hoverinfo="skip", showlegend=False,
+                     textfont=dict(size=11, color="black"))
+        fig.add_trace(go.Scattermap(**trace) if hasattr(go, "Scattermap") else go.Scattermapbox(**trace))
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=560, coloraxis_colorbar_title="Valeur")
+    return fig
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geometries_instance(inst_id: str, racine: str, niveau: int) -> list:
+    """Unités du niveau demandé sous `racine` (ou la racine elle-même), avec leur géométrie."""
+    cfg = instances_tracker()[inst_id]
+    r = session_tracker(cfg).get(
+        f"{cfg['url']}/organisationUnits.json",
+        params={"fields": "id,displayName,geometry", "filter": [f"level:eq:{niveau}", f"path:like:{racine}"],
+                "paging": "false"},
+        timeout=300,
+    )
+    r.raise_for_status()
+    return r.json().get("organisationUnits", [])
+
+
+def carte_tracker(data: pd.DataFrame, res: dict):
+    st.caption("Valeur d'un indicateur par unité pour une période, sur une carte (dégradé du plus faible au plus fort).")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ind = st.selectbox("Indicateur", sorted(data["Indicateur"].unique()), key="tr_map_ind")
+    sous = data[data["Indicateur"] == ind]
+    instances_dispo = sorted(sous["Instance"].unique())
+    with c2:
+        inst = st.selectbox("Instance", instances_dispo, key=f"tr_map_inst_{ind}")
+    sous = sous[sous["Instance"] == inst]
+    periodes = sorted(sous.loc[sous["Valeur"].notna(), "Période"].unique(), key=cle_periode)
+    if not periodes:
+        st.info("Aucune valeur pour cet indicateur.")
+        return
+    with c3:
+        pe = st.selectbox("Période", periodes, index=len(periodes) - 1, key=f"tr_map_pe_{ind}_{inst}")
+    sous = sous[sous["Période"] == pe]
+    etiquettes = st.checkbox("Afficher les étiquettes (nom et valeur)", value=True, key="tr_map_etiq")
+
+    iid = res["ids"].get(inst)
+    try:
+        meta = meta_instance(iid)
+        geoms = {}
+        for racine in meta["racines"]:
+            if res["niveau"] >= int(racine.get("level", 1)):
+                for g in geometries_instance(iid, racine["id"], res["niveau"]):
+                    geoms[g["id"]] = g
+    except Exception as e:
+        st.warning(f"Géométries indisponibles : {erreur_http(e)}")
+        return
+    features = [
+        {"type": "Feature", "properties": {"id": g["id"]}, "geometry": g["geometry"]}
+        for g in geoms.values() if (g.get("geometry") or {}).get("type") in ("Polygon", "MultiPolygon")
+    ]
+    if not features:
+        st.info("Aucune géométrie (polygone) disponible pour ce niveau : la carte ne peut pas être tracée.")
+        return
+    df_map = sous[sous["ou"].isin({f["properties"]["id"] for f in features})][["ou", "Unité", "Valeur"]]
+    df_map = df_map.rename(columns={"ou": "id"})
+    if df_map.empty:
+        st.info("Aucune valeur sur les unités cartographiables.")
+        return
+    try:
+        st.plotly_chart(construire_carte_valeurs(df_map, features, etiquettes), use_container_width=True)
+    except ImportError:
+        st.warning("La carte nécessite plotly : `pip install plotly`.")
+
+
+def carte_chaleur(data: pd.DataFrame):
+    import altair as alt
+
+    st.caption("Chaque case est une unité à une période : plus la couleur est foncée, plus la valeur est élevée.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ind = st.selectbox("Indicateur", sorted(data["Indicateur"].unique()), key="tr_heat_ind")
+    sous = data[data["Indicateur"] == ind]
+    with c2:
+        inst = st.selectbox("Instance", sorted(sous["Instance"].unique()), key=f"tr_heat_inst_{ind}")
+    with c3:
+        n = st.selectbox("Unités affichées", [10, 20, 30, 50, "Toutes"], index=1, key="tr_heat_n")
+    sous = sous[sous["Instance"] == inst]
+    ordre = sous.groupby("Unité")["Valeur"].mean().sort_values(ascending=False).index.tolist()
+    if n != "Toutes":
+        ordre = ordre[:n]
+    sous = sous[sous["Unité"].isin(ordre)]
+    if sous.empty:
+        st.info("Aucune valeur.")
+        return
+    periodes = sorted(sous["Période"].unique(), key=cle_periode)
+    graphe = (
+        alt.Chart(sous).mark_rect()
+        .encode(
+            x=alt.X("Période:O", sort=periodes, title=None, axis=alt.Axis(labelAngle=-45)),
+            y=alt.Y("Unité:N", sort=ordre, title=None, axis=alt.Axis(labelLimit=220)),
+            color=alt.Color("Valeur:Q", scale=alt.Scale(scheme="orangered"), legend=alt.Legend(title="Valeur")),
+            tooltip=["Unité", "Période", "Valeur"],
+        )
+        .properties(height=max(120, 20 * len(ordre) + 40))
+    )
+    st.altair_chart(graphe, use_container_width=True)
+    st.caption("Unités classées par valeur moyenne décroissante.")
+
+
+def classement_unites(data: pd.DataFrame):
+    import altair as alt
+
+    st.caption("Les 10 unités ayant la valeur la plus élevée pour une période, avec la variation par rapport "
+               "à une période de comparaison.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ind = st.selectbox("Indicateur", sorted(data["Indicateur"].unique()), key="tr_top_ind")
+    sous = data[data["Indicateur"] == ind]
+    with c2:
+        inst = st.selectbox("Instance", sorted(sous["Instance"].unique()), key=f"tr_top_inst_{ind}")
+    sous = sous[sous["Instance"] == inst]
+    periodes = sorted(sous.loc[sous["Valeur"].notna(), "Période"].unique(), key=cle_periode)
+    if not periodes:
+        st.info("Aucune valeur pour cet indicateur.")
+        return
+    with c3:
+        pe = st.selectbox("Période", periodes, index=len(periodes) - 1, key=f"tr_top_pe_{ind}_{inst}")
+    mode = st.radio("Comparer à", ["Période précédente", "Même période de l'année précédente"],
+                    horizontal=True, key="tr_top_mode")
+    if mode == "Période précédente":
+        i = periodes.index(pe)
+        ref_pe = periodes[i - 1] if i > 0 else None
+    else:
+        ref_pe = periode_an_precedent(pe)
+    cur = sous[sous["Période"] == pe][["Unité", "Valeur"]]
+    ref = sous[sous["Période"] == ref_pe][["Unité", "Valeur"]].rename(columns={"Valeur": "Comparaison"})
+    m = cur.merge(ref, on="Unité", how="left")
+    m["Variation"] = m["Valeur"] - m["Comparaison"]
+    m["Variation (%)"] = (m["Variation"] / m["Comparaison"] * 100).where(m["Comparaison"] != 0)
+    m["Tendance"] = m["Variation"].map(lambda v: "n.d." if pd.isna(v) else ("Hausse" if v > 0 else ("Baisse" if v < 0 else "Stable")))
+    top = m.sort_values("Valeur", ascending=False).head(10)
+    graphe = (
+        alt.Chart(top).mark_bar()
+        .encode(
+            x=alt.X("Valeur:Q", title=None),
+            y=alt.Y("Unité:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+            color=alt.Color("Tendance:N", scale=alt.Scale(domain=["Hausse", "Baisse", "Stable", "n.d."],
+                            range=["#f39c12", "#2E5C8A", "#9aa5b1", "#d9d9d9"]), legend=alt.Legend(title=f"vs {ref_pe or '—'}")),
+            tooltip=["Unité", "Valeur", "Comparaison", "Variation", "Variation (%)"],
+        )
+        .properties(height=max(80, 28 * len(top) + 20))
+    )
+    st.altair_chart(graphe, use_container_width=True)
+    aff = top.rename(columns={"Comparaison": f"Valeur {ref_pe}" if ref_pe else "Comparaison"})
+    st.dataframe(
+        aff.style.format({c: fmt_nombre for c in aff.columns if c not in ("Unité", "Tendance", "Variation (%)")}
+                         | {"Variation (%)": lambda v: "–" if pd.isna(v) else f"{v:+.1f} %"}),
+        hide_index=True, use_container_width=True,
+    )
+
+
+def petits_graphiques(data: pd.DataFrame, gran: str):
+    import altair as alt
+
+    st.caption("Une mini-courbe par unité (années superposées) pour comparer les tendances d'un coup d'œil.")
+    if gran == "Année":
+        st.info("Choisissez la granularité Mois, Trimestre ou Semaine.")
+        return
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ind = st.selectbox("Indicateur", sorted(data["Indicateur"].unique()), key="tr_sm_ind")
+    sous = data[data["Indicateur"] == ind]
+    with c2:
+        inst = st.selectbox("Instance", sorted(sous["Instance"].unique()), key=f"tr_sm_inst_{ind}")
+    sous = sous[sous["Instance"] == inst].copy()
+    sous["Année"] = sous["Période"].str[:4]
+    pos = sous["Période"].map(lambda p: position_periode(p, gran))
+    sous["Position"], sous["Repère"] = [p[0] for p in pos], [p[1] for p in pos]
+    sous = sous.dropna(subset=["Position"])
+    annees = sorted(sous["Année"].unique())
+    with c3:
+        choix = st.multiselect("Années", annees, default=annees[-2:], key=f"tr_sm_annees_{ind}_{inst}")
+    d1, d2 = st.columns(2)
+    with d1:
+        n = st.selectbox("Nombre d'unités", [8, 12, 16, 24], index=1, key="tr_sm_n")
+    with d2:
+        commune = st.checkbox("Même échelle pour toutes les unités", value=False, key="tr_sm_echelle")
+    sous = sous[sous["Année"].isin(choix)]
+    if sous.empty:
+        st.info("Aucune valeur pour cette sélection.")
+        return
+    ordre = sous.groupby("Unité")["Valeur"].mean().sort_values(ascending=False).index.tolist()[:n]
+    sous = sous[sous["Unité"].isin(ordre)].sort_values(["Année", "Position"])
+    reperes = sous.sort_values("Position")["Repère"].drop_duplicates().tolist()
+    palette = ["#9aa5b1", "#2E5C8A", "#f39c12", "#27ae60", "#8e44ad"]
+    ordre_annees = sorted(choix)
+    couleurs = [palette[i % len(palette)] for i in range(len(ordre_annees) - 1)] + ["#d73027"]
+    base = (
+        alt.Chart(sous).mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("Repère:N", sort=reperes, title=None, axis=alt.Axis(labels=False, ticks=False)),
+            y=alt.Y("Valeur:Q", title=None),
+            color=alt.Color("Année:N", scale=alt.Scale(domain=ordre_annees, range=couleurs), legend=alt.Legend(orient="bottom")),
+            tooltip=["Unité", "Année", "Repère", "Valeur"],
+        )
+        .properties(width=170, height=110)
+    )
+    graphe = base.facet(facet=alt.Facet("Unité:N", sort=ordre, title=None), columns=4)
+    if not commune:
+        graphe = graphe.resolve_scale(y="independent")
+    st.altair_chart(graphe, use_container_width=False)
+    st.caption("Unités classées par valeur moyenne décroissante.")
+
+
+def rapport_indicateurs(data: pd.DataFrame, total: pd.DataFrame, gran: str):
+    import altair as alt
+
+    st.caption("Rapport entre deux indicateurs (par exemple un taux de confirmation) : numérateur ÷ dénominateur.")
+    indicateurs = sorted(data["Indicateur"].unique())
+    if len(indicateurs) < 2:
+        st.info("Il faut au moins deux indicateurs chargés.")
+        return
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        num = st.selectbox("Numérateur", indicateurs, index=0, key="tr_rap_num")
+    with c2:
+        den = st.selectbox("Dénominateur", indicateurs, index=1, key="tr_rap_den")
+    with c3:
+        mode = st.radio("Résultat", ["Pourcentage (×100)", "Rapport simple"], key="tr_rap_mode")
+    if num == den:
+        st.info("Choisissez deux indicateurs différents.")
+        return
+    tous = preparer_series(data, total, gran, positions=False)
+    libelles = sorted(tous["Libellé"].unique(), key=lambda x: (not x.startswith("Total"), x))
+    unite = st.selectbox("Unité", libelles, key="tr_rap_unite")
+    piv = tous[tous["Libellé"] == unite].pivot_table(index="Période", columns="Indicateur", values="Valeur", aggfunc="first")
+    if num not in piv.columns or den not in piv.columns:
+        st.info("Les deux indicateurs n'ont pas de valeur pour cette unité.")
+        return
+    piv = piv.reindex(sorted(piv.index, key=cle_periode))
+    rapport = piv[num] / piv[den].where(piv[den] != 0) * (100 if mode.startswith("Pourcentage") else 1)
+    res = pd.DataFrame({"Période": piv.index, num: piv[num].values, den: piv[den].values, "Rapport": rapport.values})
+    graphe = (
+        alt.Chart(res).mark_line(point=True, strokeWidth=2.5, color="#2E5C8A")
+        .encode(x=alt.X("Période:O", sort=list(res["Période"]), title=None, axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("Rapport:Q", title="%" if mode.startswith("Pourcentage") else "Rapport"),
+                tooltip=["Période", "Rapport", num, den])
+        .properties(height=320)
+    )
+    st.altair_chart(graphe, use_container_width=True)
+    st.dataframe(
+        res.style.format({num: fmt_nombre, den: fmt_nombre, "Rapport": lambda v: "–" if pd.isna(v) else f"{v:,.2f}".replace(",", " ").replace(".", ",")}),
+        hide_index=True, use_container_width=True,
+    )
+
+
+def tableau_tracker(data: pd.DataFrame):
+    st.subheader("Indicateurs par unité et par période")
+    cols_periodes = sorted(data["Période"].unique(), key=cle_periode)
+    tableau = (
+        data.pivot_table(index=["Indicateur", "Instance", "Unité"], columns="Période", values="Valeur", aggfunc="first")
+        .reindex(columns=cols_periodes)
+        .reset_index()
+    )
+    st.dataframe(
+        tableau.style.format(fmt_nombre, subset=cols_periodes),
+        hide_index=True, use_container_width=True,
+    )
+    st.download_button(
+        "⬇️ Télécharger (CSV)",
+        data=data.drop(columns=["uid", "ou"]).to_csv(index=False).encode("utf-8-sig"),
+        file_name="dhis2_tracker_indicateurs.csv", mime="text/csv",
+    )
+
+    st.markdown("#### Évolution")
+    g1, g2 = st.columns([1, 2])
+    with g1:
+        ind = st.selectbox("Indicateur", sorted(data["Indicateur"].unique()), key="tr_graph_ind")
+    sous = data[data["Indicateur"] == ind].copy()
+    plusieurs = sous["Instance"].nunique() > 1
+    sous["Série"] = sous["Unité"] + (" (" + sous["Instance"] + ")" if plusieurs else "")
+    ordre = sous.groupby("Série")["Valeur"].sum().sort_values(ascending=False).index.tolist()
+    with g2:
+        series = st.multiselect("Unités", ordre, default=ordre[:5], key=f"tr_graph_units_{ind}")
+    if series:
+        courbe = (sous[sous["Série"].isin(series)]
+                  .pivot_table(index="Période", columns="Série", values="Valeur", aggfunc="first")
+                  .pipe(lambda d: d.reindex(sorted(d.index, key=cle_periode))))
+        st.line_chart(courbe)
+
+
+def onglet_tracker():
+    st.caption(
+        "Suivi d'indicateurs de programme (tracker) sur une ou plusieurs instances. Seules des valeurs "
+        "agrégées sont récupérées : aucune donnée individuelle n'est lue ni affichée."
+    )
+    instances = instances_tracker()
+    if not instances:
+        st.info("Aucune instance tracker configurée. Ajoutez ces lignes dans le fichier .env :")
+        st.code(EXEMPLE_ENV, language="bash")
+        return
+    catalogue = charger_catalogue_tracker()
+    if catalogue.empty:
+        st.warning("Catalogue d'indicateurs introuvable ou vide : créez le fichier tracker_indicateurs.csv "
+                   "(colonnes : instance, uid, indicateur).")
+        return
+
+    # --- 1. Instances et test de connexion ---
+    selection = st.multiselect(
+        "Instances", options=list(instances), default=list(instances),
+        format_func=lambda i: instances[i]["nom"], key="tr_instances",
+    )
+    if st.button("🔌 Tester les connexions", key="tr_test_go", disabled=not selection):
+        with st.spinner("Test des connexions…"):
+            with ThreadPoolExecutor(max_workers=min(4, len(selection))) as ex:
+                st.session_state["tr_test"] = list(ex.map(lambda i: tester_instance(instances[i]), selection))
+    if st.session_state.get("tr_test"):
+        st.dataframe(pd.DataFrame(st.session_state["tr_test"]), hide_index=True, use_container_width=True)
+    if not selection:
+        return
+
+    # --- 2. Indicateurs ---
+    memo = st.session_state.setdefault("tr_noms", {})
+    for iid in selection:
+        if iid not in memo:
+            uids = tuple(catalogue.loc[catalogue["instance"] == iid, "uid"])
+            try:
+                memo[iid] = noms_indicateurs_instance(iid, uids) if uids else {}
+            except Exception:
+                memo[iid] = {}  # noms indisponibles : on affichera les identifiants
+    noms_uid = {u: n for d in memo.values() for u, n in d.items()}
+    cat_sel = catalogue[catalogue["instance"].isin(selection)]
+    cles = list(dict.fromkeys(cat_sel["cle"]))
+    choix = st.multiselect(
+        "Indicateurs de programme", options=cles, default=cles,
+        format_func=lambda c: noms_uid.get(c, c), key="tr_indicateurs",
+    )
+
+    # --- 3. Niveau et périodes ---
+    c1, c2, c3 = st.columns([2, 1, 2])
+    niveaux = {}
+    for iid in selection:
+        try:
+            niveaux = meta_instance(iid)["niveaux"]
+            break
+        except Exception:
+            continue
+    with c1:
+        if niveaux:
+            liste = sorted(niveaux)
+            niveau = st.selectbox(
+                "Niveau géographique", liste, index=min(1, len(liste) - 1),
+                format_func=lambda n: f"{n} · {niveaux[n]}", key="tr_niveau",
+            )
+        else:
+            niveau = st.number_input("Niveau géographique", 1, 10, 3, key="tr_niveau_num")
+            st.caption("Niveaux non lus (connexion impossible) : saisie manuelle.")
+    with c2:
+        gran = st.radio("Périodes", ["Semaine", "Mois", "Trimestre", "Année"], index=1, key="tr_gran")
+    with c3:
+        an = datetime.date.today().year
+        annees = st.multiselect("Années", list(range(an, an - 11, -1)), default=[an - i for i in range(5)], key="tr_annees")
+    periodes = construire_periodes(annees, gran)
+
+    if st.button("📊 Charger les indicateurs", type="primary", key="tr_go",
+                 disabled=not (choix and periodes)):
+        with st.spinner("Interrogation des instances…"):
+            data, total, erreurs, sans_donnee = interroger_instances(
+                selection, instances, catalogue, choix, periodes, int(niveau)
+            )
+        st.session_state["tr_result"] = {
+            "data": appliquer_noms_communs(data, catalogue),
+            "total": appliquer_noms_communs(total, catalogue),
+            "erreurs": erreurs,
+            "sans_donnee": sans_donnee,
+            "gran": gran,
+            "niveau": int(niveau),
+            "ids": {instances[i]["nom"]: i for i in selection},
+        }
+
+    res = st.session_state.get("tr_result")
+    if not res:
+        return
+    if res["erreurs"]:
+        st.warning("Instances non interrogées :\n\n" + "\n\n".join(res["erreurs"]))
+    if res["sans_donnee"]:
+        st.info("Aucune valeur renvoyée pour : " + " ; ".join(res["sans_donnee"]))
+    data = res["data"]
+    if data.empty:
+        st.info("Aucune donnée pour ces paramètres.")
+        return
+
+    total = res.get("total", pd.DataFrame(columns=COLONNES_TRACKER))
+    gran_res = res.get("gran", "Mois")
+    onglets = st.tabs(
+        ["📋 Tableau", "📈 Années superposées", "🛡️ Canal endémique", "➕ Cumul annuel", "🗺️ Carte",
+         "🟧 Carte de chaleur", "🏆 Classement", "🔲 Par unité", "➗ Rapport"]
+    )
+    with onglets[0]:
+        tableau_tracker(data)
+    with onglets[1]:
+        courbes_annees(data, total, gran_res)
+    with onglets[2]:
+        canal_endemique(data, total, gran_res)
+    with onglets[3]:
+        courbes_annees(data, total, gran_res, cumul=True)
+    with onglets[4]:
+        carte_tracker(data, res)
+    with onglets[5]:
+        carte_chaleur(data)
+    with onglets[6]:
+        classement_unites(data)
+    with onglets[7]:
+        petits_graphiques(data, gran_res)
+    with onglets[8]:
+        rapport_indicateurs(data, total, gran_res)
+tab_ext, tab_comp, tab_qd, tab_val, tab_tr = st.tabs(
+    ["📥 Extraction", "✅ Complétude", "🔍 Qualité des données", "🧪 Validation", "🧭 Tracker"]
 )
 with tab_ext:
     onglet_extraction()
@@ -2488,3 +3418,5 @@ with tab_qd:
     onglet_qualite()
 with tab_val:
     onglet_validation()
+with tab_tr:
+    onglet_tracker()
