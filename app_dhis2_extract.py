@@ -1,7 +1,8 @@
 """
+V2
 Application Streamlit : extraction de données DHIS2
 (un formulaire x une unité d'organisation x N dernières années)
-Trois onglets indépendants : « Extraction », « Complétude » et « Qualité des données ».
+Quatre onglets indépendants : « Extraction », « Complétude », « Qualité des données » et « Tableaux de bord ».
 Les données extraites sont agrégées par année : pour chaque élément de données, on cumule
 toutes les combinaisons de catégories (categoryOptionCombo).
 
@@ -71,6 +72,35 @@ def lister(url, mode, user, password, token, ressource) -> pd.DataFrame:
 def dictionnaire_noms(url, mode, user, password, token, ressource) -> dict:
     df = lister(url, mode, user, password, token, ressource)
     return dict(zip(df["id"], df["displayName"]))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def unites_avec_niveau(url, mode, user, password, token) -> pd.DataFrame:
+    """Unités d'organisation avec leur niveau hiérarchique (id, displayName, level)."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/organisationUnits.json",
+        params={"fields": "id,displayName,level", "paging": "false"},
+        timeout=300,
+    )
+    r.raise_for_status()
+    return pd.DataFrame(r.json().get("organisationUnits", []))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def noms_niveaux(url, mode, user, password, token) -> dict:
+    """{niveau: nom} des niveaux hiérarchiques (ressource organisationUnitLevels)."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/organisationUnitLevels.json",
+        params={"fields": "level,displayName", "paging": "false"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return {
+        int(x["level"]): x.get("displayName", f"Niveau {x['level']}")
+        for x in r.json().get("organisationUnitLevels", [])
+    }
 
 
 def extraire_annee(s, url, dataset, orgunit, enfants, annee) -> pd.DataFrame:
@@ -431,8 +461,32 @@ def analyse_validation(url, mode, user, password, token, groupe, orgunit, debut,
     return j
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def valeurs_aberrantes(
+    url, mode, user, password, token, formulaires, orgunit, debut, fin, algo, seuil, max_resultats
+) -> list:
+    """Valeurs aberrantes d'un ou plusieurs formulaires (API outlierDetection)."""
+    s = make_session(mode, user, password, token)
+    params = {
+        "ds": list(formulaires),
+        "ou": orgunit,
+        "startDate": debut,
+        "endDate": fin,
+        "algorithm": algo,
+        "maxResults": max_resultats,
+    }
+    if algo != "MIN_MAX":
+        params["threshold"] = seuil
+    r = s.get(f"{url}/outlierDetection.json", params=params, timeout=900)
+    r.raise_for_status()
+    j = r.json()
+    if isinstance(j, dict):
+        j = j.get("outlierValues") or next((v for v in j.values() if isinstance(v, list)), [])
+    return j
+
+
 def formulaires_a_ouvrir(regle: dict, de_ds: dict, noms_ds: dict) -> tuple:
-    """Formulaire(s) contenant les éléments de la règle + liste des éléments concernés."""
+    """(noms des formulaires, éléments concernés, ID des formulaires) pour une règle."""
     expr = " ".join(
         ((regle.get(c) or {}).get("expression") or "") for c in ("leftSide", "rightSide")
     )
@@ -444,10 +498,201 @@ def formulaires_a_ouvrir(regle: dict, de_ds: dict, noms_ds: dict) -> tuple:
     for ds in RE_DS.findall(expr):
         compte[ds] = compte.get(ds, 0) + 1
     if not compte:
-        return "", de_ids
+        return "", de_ids, []
     maxi = max(compte.values())
-    noms = sorted(noms_ds.get(ds, ds) for ds, n in compte.items() if n == maxi)
-    return " | ".join(noms), de_ids
+    ids = sorted((ds for ds, n in compte.items() if n == maxi), key=lambda d: noms_ds.get(d, d))
+    return " | ".join(noms_ds.get(d, d) for d in ids), de_ids, ids
+
+
+def _id(x):
+    """ID d'une référence DHIS2 (chaîne ou objet {"id": ...})."""
+    return x.get("id") if isinstance(x, dict) else x
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def soumissions_formulaire(url, mode, user, password, token, dataset, orgunit, debut, fin) -> list:
+    """Formulaires marqués comme complétés (soumis) : unité, période, date, utilisateur."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/completeDataSetRegistrations.json",
+        params={"dataSet": dataset, "orgUnit": orgunit, "children": "true", "startDate": debut, "endDate": fin},
+        timeout=600,
+    )
+    r.raise_for_status()
+    j = r.json()
+    regs = j.get("completeDataSetRegistrations", []) if isinstance(j, dict) else j
+    sorties, vus = [], set()
+    for x in regs:
+        if x.get("completed") is False:
+            continue
+        cle = (_id(x.get("organisationUnit")), _id(x.get("period")))
+        if cle in vus or not all(cle):
+            continue
+        vus.add(cle)
+        sorties.append(
+            {"ou": cle[0], "pe": cle[1], "date": str(x.get("date") or x.get("lastUpdated") or "")[:10],
+             "par": x.get("storedBy") or ""}
+        )
+    return sorties
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def valeurs_saisies(url, mode, user, password, token, dataset, orgunit, debut, fin) -> pd.DataFrame:
+    """(unité, période, élément de données) pour lesquels au moins une valeur existe."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/dataValueSets.json",
+        params={"dataSet": dataset, "orgUnit": orgunit, "children": "true", "startDate": debut, "endDate": fin},
+        timeout=900,
+    )
+    r.raise_for_status()
+    df = pd.DataFrame(r.json().get("dataValues", []))
+    if df.empty:
+        return pd.DataFrame(columns=["orgUnit", "period", "dataElement"])
+    return df[["orgUnit", "period", "dataElement"]].drop_duplicates()
+
+
+def calculer_manquantes(soumissions, valeurs, elements, noms_de, nom_formulaire, ds_id, noms_unites):
+    """Pour chaque formulaire soumis, liste les éléments de données sans aucune valeur.
+    Renvoie (lignes par soumission, détail par élément manquant)."""
+    presents = {}
+    for ou, pe, de in valeurs.itertuples(index=False):
+        presents.setdefault((ou, pe), set()).add(de)
+    attendus = set(elements)
+    lignes, details = [], []
+    for sub in soumissions:
+        saisis = presents.get((sub["ou"], sub["pe"]), set()) & attendus
+        manquants = [d for d in elements if d not in saisis]
+        if not manquants:
+            continue
+        unite = noms_unites.get(sub["ou"], sub["ou"])
+        noms = [noms_de.get(d, d) for d in manquants]
+        liste = "; ".join(noms[:12]) + (f" … (+{len(noms) - 12})" if len(noms) > 12 else "")
+        lignes.append(
+            {
+                "Formulaire": nom_formulaire,
+                "Unité d'organisation": unite,
+                "Période": sub["pe"],
+                "Soumis le": sub["date"],
+                "Soumis par": sub["par"],
+                "Éléments attendus": len(elements),
+                "Éléments renseignés": len(saisis),
+                "Éléments manquants": len(manquants),
+                "Taux de renseignement (%)": round(len(saisis) / len(elements) * 100, 1),
+                "Formulaire vide": "Oui" if not saisis else "Non",
+                "Liste des éléments manquants": liste,
+                "Lien de saisie": lien_saisie(ds_id, sub["ou"], sub["pe"]),
+            }
+        )
+        details += [
+            {"Formulaire": nom_formulaire, "Unité d'organisation": unite, "Période": sub["pe"],
+             "Élément de données manquant": n}
+            for n in noms
+        ]
+    return lignes, details
+
+
+LIEN_SAISIE_DEFAUT = (
+    "{base}/dhis-web-aggregate-data-entry/index.html#/?dataSetId={ds}&orgUnitId={ou}&periodId={pe}"
+)
+
+
+def base_dhis2(api_url: str) -> str:
+    """URL de l'instance, sans le suffixe /api (ou /api/NN)."""
+    return re.sub(r"/api(/\d+)?/?$", "", api_url)
+
+
+def lien_saisie(ds, ou, pe):
+    """Lien vers l'écran de saisie (application Saisie de données) pour corriger une valeur.
+    Modèle modifiable via DHIS2_ENTRY_URL_TEMPLATE ({base}, {ds}, {ou}, {pe})."""
+    if not (ds and ou and pe):
+        return None
+    modele = secret("DHIS2_ENTRY_URL_TEMPLATE", LIEN_SAISIE_DEFAUT)
+    return modele.format(base=base_dhis2(url), ds=ds, ou=ou, pe=pe)
+
+
+def config_lien() -> dict:
+    try:
+        return {"Lien de saisie": st.column_config.LinkColumn("Saisie", display_text="Ouvrir ↗")}
+    except TypeError:  # anciennes versions de Streamlit
+        return {"Lien de saisie": st.column_config.LinkColumn("Saisie")}
+
+
+def filtre_multi(label: str, options, key: str) -> list:
+    """Multiselect de filtre ; retire les anciennes sélections devenues invalides."""
+    options = [o for o in options if o not in (None, "")]
+    st.session_state[key] = [v for v in st.session_state.get(key, []) if v in options]
+    return st.multiselect(label, options=options, key=key)
+
+
+COULEURS_IMPORTANCE = {"Haute": "#d73027", "Moyenne": "#f39c12", "Faible": "#f4d03f"}
+
+
+def graphique_compte(
+    df: pd.DataFrame,
+    col: str,
+    titre: str,
+    top: int = 10,
+    ordre: str = "valeur",
+    vertical: bool = False,
+    ordre_fixe: list = None,
+    couleurs: dict = None,
+):
+    """Graphique en barres : nombre de lignes par modalité de `col`.
+    - horizontal (défaut) trié par valeur : classements (top N) ;
+    - vertical trié par libellé : évolution dans le temps ;
+    - `ordre_fixe` / `couleurs` : ordre et couleurs imposés (ex. importance)."""
+    import altair as alt
+
+    compte = df[col].replace("", "(vide)").fillna("(vide)").astype(str).value_counts()
+    if ordre_fixe:
+        ordre_fixe = list(ordre_fixe) + [i for i in compte.index if i not in ordre_fixe]
+        compte = compte.reindex(ordre_fixe, fill_value=0)
+    compte = compte.reset_index()
+    compte.columns = ["Libellé", "Nombre"]
+    if ordre == "valeur" and not ordre_fixe:
+        compte = compte.head(top)
+
+    if ordre_fixe:
+        tri = ordre_fixe
+    elif ordre == "valeur":
+        tri = "-y" if vertical else "-x"
+    else:
+        tri = "ascending"
+
+    if couleurs:
+        palette = {**couleurs, "(vide)": "#bdbdbd"}
+        modalites = [m for m in compte["Libellé"] if m in palette]
+        couleur = alt.Color(
+            "Libellé:N",
+            scale=alt.Scale(domain=modalites, range=[palette[m] for m in modalites]),
+            legend=None,
+        )
+    else:
+        couleur = alt.value("#2E5C8A")
+
+    if vertical:
+        axe_x = alt.X(
+            "Libellé:N",
+            sort=tri,
+            title=None,
+            axis=alt.Axis(labelAngle=-45 if len(compte) > 6 else 0, labelLimit=160),
+        )
+        axe_y = alt.Y("Nombre:Q", title=None, axis=alt.Axis(tickMinStep=1))
+        hauteur = 280
+    else:
+        axe_x = alt.X("Nombre:Q", title=None, axis=alt.Axis(tickMinStep=1))
+        axe_y = alt.Y("Libellé:N", sort=tri, title=None, axis=alt.Axis(labelLimit=260))
+        hauteur = max(70, 26 * len(compte) + 20)
+
+    st.markdown(f"**{titre}**")
+    graphe = (
+        alt.Chart(compte)
+        .mark_bar()
+        .encode(x=axe_x, y=axe_y, color=couleur, tooltip=["Libellé", "Nombre"])
+        .properties(height=hauteur)
+    )
+    st.altair_chart(graphe, use_container_width=True)
 
 
 def vers_nombre(x):
@@ -455,6 +700,209 @@ def vers_nombre(x):
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+# ---- Tableaux de bord : chargement des tableaux croisés ----
+CHAMPS_VISUALISATION = (
+    "id,displayName,type,"
+    "columns[dimension,items[dimensionItem,id]],rows[dimension,items[dimensionItem,id]],"
+    "filters[dimension,items[dimensionItem,id]],dataDimensionItems[:all],relativePeriods,"
+    "organisationUnitLevels,itemOrganisationUnitGroups[id],userOrganisationUnit,"
+    "userOrganisationUnitChildren,userOrganisationUnitGrandChildren"
+)
+LIBELLES_DIMENSIONS = {
+    "dx": "Donnée",
+    "pe": "Période",
+    "ou": "Unité d'organisation",
+    "co": "Combinaison de catégories",
+}
+
+
+def periodes_relatives(viz: dict) -> list:
+    """Périodes relatives cochées (ex. last12Months -> LAST_12_MONTHS)."""
+    rp = viz.get("relativePeriods") or {}
+    return [
+        re.sub(r"(?<=[a-z])(?=[A-Z0-9])|(?<=[0-9])(?=[A-Z])", "_", k).upper()
+        for k, v in rp.items()
+        if v is True
+    ]
+
+
+def elements_dx_depuis_dimensions(viz: dict) -> list:
+    """Éléments de la dimension « données » à partir de dataDimensionItems (si items vide)."""
+    sortie = []
+    for d in viz.get("dataDimensionItems", []) or []:
+        t = d.get("dataDimensionItemType")
+        try:
+            if t == "INDICATOR":
+                sortie.append(d["indicator"]["id"])
+            elif t == "DATA_ELEMENT":
+                sortie.append(d["dataElement"]["id"])
+            elif t == "DATA_ELEMENT_OPERAND":
+                op = d["dataElementOperand"]
+                coc = (op.get("categoryOptionCombo") or {}).get("id")
+                sortie.append(op["dataElement"]["id"] + (f".{coc}" if coc else ""))
+            elif t == "REPORTING_RATE":
+                rr = d["reportingRate"]
+                sortie.append(f"{rr['dataSet']['id']}.{rr['metric']}")
+            elif t == "PROGRAM_INDICATOR":
+                sortie.append(d["programIndicator"]["id"])
+        except (KeyError, TypeError):
+            continue
+    return sortie
+
+
+def requete_analytics(viz: dict, periodes: list = None, unites_ou: list = None) -> dict:
+    """Paramètres analytics reconstruits depuis la définition de la visualisation.
+    Si `periodes` est fourni (ex. ["2026", "202611"]), la dimension « période » de la
+    visualisation est remplacée par ces périodes explicites (filtrage année/mois)."""
+
+    def dimension(obj: dict) -> str:
+        dim = obj.get("dimension")
+        items = [i.get("dimensionItem") or i.get("id") for i in obj.get("items", []) or []]
+        items = [i for i in items if i]
+        if dim == "dx" and not items:
+            items = elements_dx_depuis_dimensions(viz)
+        if dim == "pe":
+            items = list(periodes) if periodes is not None else items + periodes_relatives(viz)
+        if dim == "ou":
+            if unites_ou is not None:
+                # filtre utilisateur : remplace les unités enregistrées dans la visualisation
+                items = list(unites_ou)
+            else:
+                items += [f"LEVEL-{n}" for n in viz.get("organisationUnitLevels", []) or []]
+                items += [f"OU_GROUP-{g['id']}" for g in viz.get("itemOrganisationUnitGroups", []) or []]
+                if viz.get("userOrganisationUnit"):
+                    items.append("USER_ORGUNIT")
+                if viz.get("userOrganisationUnitChildren"):
+                    items.append("USER_ORGUNIT_CHILDREN")
+                if viz.get("userOrganisationUnitGrandChildren"):
+                    items.append("USER_ORGUNIT_GRANDCHILDREN")
+        items = list(dict.fromkeys(items))
+        return dim + (":" + ";".join(items) if items else "")
+
+    lignes = [o["dimension"] for o in viz.get("rows", []) or []]
+    colonnes = [o["dimension"] for o in viz.get("columns", []) or []]
+    params = {
+        "dimension": [dimension(o) for o in (viz.get("columns") or []) + (viz.get("rows") or [])],
+        "skipMeta": "false",
+        "displayProperty": "NAME",
+    }
+    filtres = [dimension(o) for o in viz.get("filters", []) or []]
+    if filtres:
+        params["filter"] = filtres
+    if periodes is not None and not any(d.startswith("pe") for d in params["dimension"]):
+        # la visualisation ne porte pas de dimension « période » : on filtre quand même
+        params.setdefault("filter", []).append("pe:" + ";".join(periodes))
+    if unites_ou is not None and not any(d.startswith("ou") for d in params["dimension"]):
+        params.setdefault("filter", []).append("ou:" + ";".join(unites_ou))
+    return {"params": params, "lignes": lignes, "colonnes": colonnes}
+
+
+def construire_tableau(rep: dict, lignes: list, colonnes: list) -> pd.DataFrame:
+    """Tableau croisé (lignes x colonnes) à partir d'une réponse analytics."""
+    df = pd.DataFrame(rep.get("rows", []), columns=[h["name"] for h in rep["headers"]])
+    meta = rep.get("metaData", {}) or {}
+    items, dims_meta = meta.get("items", {}) or {}, meta.get("dimensions", {}) or {}
+    nom = lambda i: (items.get(i) or {}).get("name", i)
+    libelle = lambda d: LIBELLES_DIMENSIONS.get(d) or nom(d)
+    lignes = [d for d in lignes if d in df.columns]
+    colonnes = [d for d in colonnes if d in df.columns]
+    if df.empty:
+        return pd.DataFrame()
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    for dim in lignes + colonnes:
+        ordre = [nom(i) for i in dims_meta.get(dim, list(df[dim].unique()))]
+        df[dim] = pd.Categorical(df[dim].map(nom), categories=list(dict.fromkeys(ordre)), ordered=True)
+
+    if lignes and colonnes:
+        t = df.pivot_table(index=lignes, columns=colonnes, values="value", aggfunc="first", observed=True)
+    elif lignes:
+        t = df.groupby(lignes, observed=True)["value"].first().to_frame("Valeur")
+    elif colonnes:
+        t = df.groupby(colonnes, observed=True)["value"].first().to_frame("Valeur").T
+    else:
+        t = df[["value"]].rename(columns={"value": "Valeur"})
+    if isinstance(t.columns, pd.MultiIndex):
+        t.columns = [" | ".join(str(x) for x in c) for c in t.columns]
+    else:
+        t.columns = [str(c) for c in t.columns]
+    if lignes:
+        t.index = t.index.set_names([libelle(d) for d in lignes])
+        t = t.reset_index()
+    return t
+
+
+def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, periodes: list = None,
+                               unites_ou: list = None, ou_mode: str = None) -> dict:
+    """Charge les tableaux d'un tableau de bord : (a) définition des éléments, (b) définition
+    de chaque visualisation, (c) données via analytics, reconstruites en tableau croisé."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/dashboards/{dashboard_id}.json",
+        params={
+            "fields": "id,displayName,dashboardItems[id,type,visualization[id,displayName,type],"
+            "reportTable[id,displayName],map[id,displayName],eventVisualization[id,displayName,type],"
+            "eventChart[id,displayName],eventReport[id,displayName],text]"
+        },
+        timeout=120,
+    )
+    r.raise_for_status()
+    dash = r.json()
+
+    a_charger, autres = [], []
+    for it in dash.get("dashboardItems", []) or []:
+        typ = it.get("type")
+        viz = it.get("visualization")
+        if viz:
+            if viz.get("type") == "PIVOT_TABLE" or inclure_graphiques:
+                a_charger.append(("visualizations", viz["id"], viz.get("displayName") or viz["id"], viz.get("type")))
+            else:
+                autres.append(f"{viz.get('displayName', viz['id'])} ({viz.get('type', typ)})")
+        elif it.get("reportTable"):
+            rt = it["reportTable"]
+            a_charger.append(("reportTables", rt["id"], rt.get("displayName") or rt["id"], "REPORT_TABLE"))
+        else:
+            ref = next(
+                (it[k] for k in ("map", "eventVisualization", "eventChart", "eventReport") if it.get(k)), None
+            )
+            autres.append(f"{(ref or {}).get('displayName', typ)} ({typ})")
+
+    tables, erreurs = [], []
+    for ressource, uid, nom_viz, type_viz in a_charger:
+        try:
+            rv = s.get(f"{url}/{ressource}/{uid}.json", params={"fields": CHAMPS_VISUALISATION}, timeout=120)
+            rv.raise_for_status()
+            viz = rv.json()
+            q = requete_analytics(viz, periodes, unites_ou)
+            params_analytics = dict(q["params"])
+            if ou_mode:
+                params_analytics["ouMode"] = ou_mode
+            ra = s.get(f"{url}/analytics.json", params=params_analytics, timeout=300)
+            ra.raise_for_status()
+            rep = ra.json()
+            t = construire_tableau(rep, q["lignes"], q["colonnes"])
+            tables.append(
+                {
+                    "id": uid,
+                    "nom": viz.get("displayName") or nom_viz,
+                    "type": type_viz,
+                    "df": t,
+                    "lignes": q["lignes"],
+                    "colonnes": q["colonnes"],
+                    "requete": q["params"],
+                    "nb_lignes_analytics": len(rep.get("rows", [])),
+                }
+            )
+        except Exception as e:
+            erreurs.append(f"{nom_viz} : {e}")
+    return {
+        "id": dashboard_id,
+        "nom": dash.get("displayName", dashboard_id),
+        "tables": tables,
+        "autres": autres,
+        "erreurs": erreurs,
+    }
 
 
 # ------------------------------------------------------------------
@@ -993,12 +1441,94 @@ def onglet_completude():
 
 
 # ------------------------------------------------------------------
-# Onglet 3 : qualité des données (règles de validation)
+# Onglet 3 : qualité des données (règles de validation, valeurs aberrantes)
 # ------------------------------------------------------------------
-def onglet_qualite():
+def synthese_et_tableaux_validation(res: dict):
+    """Affiche filtres, synthèse visuelle et tableaux par groupe des erreurs de validation."""
+    if res["erreurs"]:
+        st.warning(
+            "Analyse impossible pour certains groupes (droits insuffisants ou erreur serveur) :\n\n"
+            + "\n\n".join(res["erreurs"])
+        )
+    if not res["resume"]:
+        return
+    st.subheader(f"Résultats : {res['unite']} ({res['periode']})")
+    if not res["lignes"]:
+        st.success("Aucune erreur détectée par les règles de validation sélectionnées. ✅")
+        return
+
+    df = pd.DataFrame(res["lignes"])
+    total = len(df)
+    df["_o"] = df["Importance"].map(ORDRE_IMPORTANCE).fillna(3)
+    df = df.sort_values(["Groupe", "_o", "Règle", "Unité d'organisation", "Période"]).drop(columns="_o")
+
+    with st.expander("🔎 Filtres", expanded=True):
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            sel_imp = filtre_multi(
+                "Importance",
+                sorted(df["Importance"].unique(), key=lambda x: ORDRE_IMPORTANCE.get(x, 3)),
+                "qd_f_imp",
+            )
+        with f2:
+            sel_regle = filtre_multi("Règle", sorted(df["Règle"].dropna().unique()), "qd_f_regle")
+        with f3:
+            sel_ou = filtre_multi(
+                "Unité d'organisation", sorted(df["Unité d'organisation"].dropna().unique()), "qd_f_ou"
+            )
+    for col, sel in (("Importance", sel_imp), ("Règle", sel_regle), ("Unité d'organisation", sel_ou)):
+        if sel:
+            df = df[df[col].isin(sel)]
+    if df.empty:
+        st.info("Aucune erreur ne correspond aux filtres choisis.")
+        return
+
+    st.metric("Erreurs à corriger (filtres appliqués)", f"{len(df):,}".replace(",", " "),
+              help=f"Total sans filtre : {total}")
+
+    st.markdown("### Synthèse")
+    c1, c2 = st.columns(2)
+    with c1:
+        graphique_compte(df, "Groupe", "Erreurs par groupe de règles")
+    with c2:
+        graphique_compte(
+            df, "Importance", "Erreurs par importance",
+            ordre_fixe=["Haute", "Moyenne", "Faible"], couleurs=COULEURS_IMPORTANCE,
+        )
+    c3, c4 = st.columns(2)
+    with c3:
+        graphique_compte(df, "Règle", "Règles les plus souvent non respectées (top 10)")
+    with c4:
+        graphique_compte(df, "Unité d'organisation", "Unités avec le plus d'erreurs (top 10)")
+
+    st.download_button(
+        "⬇️ Télécharger les erreurs affichées (CSV)",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="dhis2_erreurs_validation.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("### Détail par groupe de règles")
+    for ligne in res["resume"]:
+        groupe = ligne["Groupe"]
+        sous = df[df["Groupe"] == groupe].drop(columns="Groupe")
+        if sous.empty:
+            st.markdown(f"#### {groupe}")
+            st.caption("✅ Aucune erreur dans ce groupe (avec les filtres actuels).")
+            continue
+        with st.expander(f"❌ {groupe} : {len(sous)} erreur(s)", expanded=True):
+            st.dataframe(
+                sous,
+                hide_index=True,
+                use_container_width=True,
+                height=min(500, 40 + 35 * len(sous)),
+                column_config=config_lien(),
+            )
+
+
+def sous_onglet_validation(orgunit_id, debut, fin):
     st.caption(
-        "Exécute les règles de validation, groupe par groupe, sur l'unité d'organisation "
-        "choisie (et ses descendantes) et liste les erreurs à corriger."
+        "Exécute les règles de validation, groupe par groupe, et liste les erreurs à corriger."
     )
     try:
         groupes = groupes_validation(url, mode, user, password, token)
@@ -1010,31 +1540,16 @@ def onglet_qualite():
         return
     noms_g = {g["id"]: g["displayName"] for g in groupes}
     nb_regles = {g["id"]: len(g.get("validationRules", [])) for g in groupes}
-
-    col1, col2 = st.columns(2)
-    with col1:
-        choix = st.multiselect(
-            "Groupes de règles de validation",
-            options=list(noms_g),
-            default=list(noms_g),
-            format_func=lambda i: f"{noms_g[i]} ({nb_regles[i]} règle(s))",
-            key="qd_groupes",
-        )
-    with col2:
-        orgunit_id = choisir_unite("qd")
-    col3, col4 = st.columns(2)
-    with col3:
-        debut = st.date_input("Début de la période", value=datetime.date(annee_fin, 1, 1), key="qd_debut")
-    with col4:
-        fin = st.date_input("Fin de la période", value=datetime.date.today(), key="qd_fin")
-    if debut > fin:
-        st.warning("La date de début doit précéder la date de fin.")
-    st.caption(
-        "⚠️ Sur une grande unité (pays, région) et une longue période, l'analyse peut être longue."
+    choix = st.multiselect(
+        "Groupes de règles de validation",
+        options=list(noms_g),
+        default=list(noms_g),
+        format_func=lambda i: f"{noms_g[i]} ({nb_regles[i]} règle(s))",
+        key="qd_groupes",
     )
 
     if st.button(
-        "🔎 Lancer le contrôle qualité",
+        "🔎 Lancer le contrôle des règles",
         type="primary",
         disabled=not (choix and orgunit_id and debut <= fin),
         key="qd_go",
@@ -1063,7 +1578,7 @@ def onglet_qualite():
             for v in violations:
                 rid = v.get("validationRuleId") or (v.get("validationRule") or {}).get("id")
                 regle = regles.get(rid, {})
-                formulaire, de_ids = formulaires_a_ouvrir(regle, de_ds, noms_formulaires)
+                formulaire, de_ids, ds_ids = formulaires_a_ouvrir(regle, de_ds, noms_formulaires)
                 imp = IMPORTANCE.get(v.get("importance") or regle.get("importance"), "")
                 op = v.get("operator") or regle.get("operator") or ""
                 gauche = vers_nombre(v.get("leftsideValue"))
@@ -1082,6 +1597,11 @@ def onglet_qualite():
                         "Valeur droite": droite,
                         "Écart": None if gauche is None or droite is None else gauche - droite,
                         "Formulaire(s) à ouvrir": formulaire,
+                        "Lien de saisie": lien_saisie(
+                            ds_ids[0] if ds_ids else None,
+                            v.get("organisationUnitId"),
+                            v.get("periodId"),
+                        ),
                         "Éléments de données à vérifier": ", ".join(noms_de.get(d, d) for d in de_ids),
                         "Instruction de correction": regle.get("instruction", ""),
                     }
@@ -1096,53 +1616,502 @@ def onglet_qualite():
         }
 
     res = st.session_state.get("qd_result")
+    if res:
+        synthese_et_tableaux_validation(res)
+
+
+ALGORITHMES = {
+    "Z_SCORE": "Z-score (écart à la moyenne)",
+    "MOD_Z_SCORE": "Z-score modifié (écart à la médiane)",
+    "MIN_MAX": "Min-max (bornes définies dans DHIS2)",
+}
+
+
+def sous_onglet_aberrantes(orgunit_id, debut, fin):
+    st.caption(
+        "Repère les valeurs très éloignées de l'historique de l'unité (trop élevées ou trop basses), "
+        "souvent des erreurs de saisie (virgule oubliée, zéro en trop…)."
+    )
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        choix = st.multiselect(
+            "Formulaires à analyser",
+            options=df_ds["id"].tolist(),
+            format_func=lambda i: noms_ds.get(i, i),
+            key="ab_ds",
+        )
+    with col2:
+        algo = st.selectbox(
+            "Méthode", list(ALGORITHMES), format_func=lambda a: ALGORITHMES[a], key="ab_algo"
+        )
+    with col3:
+        seuil = st.number_input(
+            "Seuil", min_value=0.5, max_value=20.0, value=3.0, step=0.5,
+            disabled=(algo == "MIN_MAX"), key="ab_seuil",
+            help="Plus le seuil est bas, plus il y a de valeurs signalées. 3 est la valeur usuelle.",
+        )
+    max_res = st.number_input(
+        "Nombre maximal de valeurs renvoyées", min_value=50, max_value=5000, value=500, step=50, key="ab_max"
+    )
+
+    if st.button(
+        "📈 Rechercher les valeurs aberrantes",
+        type="primary",
+        disabled=not (choix and orgunit_id and debut <= fin),
+        key="ab_go",
+    ):
+        try:
+            de_ds, _noms_de, noms_formulaires = elements_et_formulaires(url, mode, user, password, token)
+            with st.spinner("Analyse en cours…"):
+                valeurs = valeurs_aberrantes(
+                    url, mode, user, password, token, tuple(choix), orgunit_id,
+                    debut.isoformat(), fin.isoformat(), algo, float(seuil), int(max_res),
+                )
+        except Exception as e:
+            st.error(f"Analyse impossible (droits insuffisants, version de DHIS2 trop ancienne ou erreur serveur) : {e}")
+            return
+        lignes = []
+        for v in valeurs:
+            de = v.get("de")
+            ds_ids = [d for d in de_ds.get(de, []) if d in choix] or de_ds.get(de, [])
+            val, moy = vers_nombre(v.get("value")), vers_nombre(v.get("mean"))
+            bas, haut = vers_nombre(v.get("lowerBound")), vers_nombre(v.get("upperBound"))
+            if val is None:
+                sens = ""
+            elif haut is not None and val > haut:
+                sens = "Trop élevée"
+            elif bas is not None and val < bas:
+                sens = "Trop basse"
+            elif moy is not None:
+                sens = "Trop élevée" if val > moy else "Trop basse"
+            else:
+                sens = ""
+            arrondi = lambda x: None if x is None else round(x, 2)
+            lignes.append(
+                {
+                    "Élément de données": v.get("deName") or de,
+                    "Combinaison": v.get("cocName", ""),
+                    "Unité d'organisation": v.get("ouName") or v.get("ou"),
+                    "Période": v.get("pe"),
+                    "Valeur": val,
+                    "Moyenne": arrondi(moy),
+                    "Écart-type": arrondi(vers_nombre(v.get("stdDev"))),
+                    "Z-score": arrondi(vers_nombre(v.get("zScore"))),
+                    "Borne basse": arrondi(bas),
+                    "Borne haute": arrondi(haut),
+                    "Anomalie": sens,
+                    "Formulaire(s) à ouvrir": " | ".join(sorted(noms_formulaires.get(d, d) for d in ds_ids)),
+                    "Lien de saisie": lien_saisie(ds_ids[0] if ds_ids else None, v.get("ou"), v.get("pe")),
+                }
+            )
+        st.session_state["ab_result"] = {
+            "lignes": lignes,
+            "unite": noms_ou.get(orgunit_id, orgunit_id),
+            "periode": f"{debut.isoformat()} → {fin.isoformat()}",
+            "limite": int(max_res),
+        }
+
+    res = st.session_state.get("ab_result")
+    if not res:
+        return
+    st.subheader(f"Valeurs aberrantes : {res['unite']} ({res['periode']})")
+    if not res["lignes"]:
+        st.success("Aucune valeur aberrante détectée avec ces paramètres. ✅")
+        return
+    if len(res["lignes"]) >= res["limite"]:
+        st.warning(
+            "La limite de résultats est atteinte : il peut y avoir d'autres valeurs aberrantes. "
+            "Augmentez la limite ou réduisez l'unité, la période ou les formulaires."
+        )
+    df = pd.DataFrame(res["lignes"])
+    total = len(df)
+
+    with st.expander("🔎 Filtres", expanded=True):
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            sel_an = filtre_multi("Anomalie", sorted(df["Anomalie"].unique()), "ab_f_an")
+        with f2:
+            sel_de = filtre_multi("Élément de données", sorted(df["Élément de données"].dropna().unique()), "ab_f_de")
+        with f3:
+            sel_ou = filtre_multi("Unité d'organisation", sorted(df["Unité d'organisation"].dropna().unique()), "ab_f_ou")
+        with f4:
+            sel_pe = filtre_multi("Période", sorted(df["Période"].dropna().unique()), "ab_f_pe")
+    for col, sel in (
+        ("Anomalie", sel_an), ("Élément de données", sel_de),
+        ("Unité d'organisation", sel_ou), ("Période", sel_pe),
+    ):
+        if sel:
+            df = df[df[col].isin(sel)]
+    if df.empty:
+        st.info("Aucune valeur ne correspond aux filtres choisis.")
+        return
+
+    st.metric("Valeurs à vérifier (filtres appliqués)", f"{len(df):,}".replace(",", " "),
+              help=f"Total sans filtre : {total}")
+    st.markdown("### Synthèse")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Sens de l'anomalie**")
+        k1, k2 = st.columns(2)
+        k1.metric("Trop élevées", int((df["Anomalie"] == "Trop élevée").sum()))
+        k2.metric("Trop basses", int((df["Anomalie"] == "Trop basse").sum()))
+    with c2:
+        graphique_compte(df, "Période", "Valeurs aberrantes par période", ordre="libelle", vertical=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        graphique_compte(df, "Élément de données", "Éléments de données les plus concernés (top 10)")
+    with c4:
+        graphique_compte(df, "Unité d'organisation", "Unités avec le plus de valeurs aberrantes (top 10)")
+
+    st.download_button(
+        "⬇️ Télécharger les valeurs affichées (CSV)",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="dhis2_valeurs_aberrantes.csv",
+        mime="text/csv",
+    )
+    st.markdown("### Détail")
+    st.dataframe(df, hide_index=True, use_container_width=True, height=500, column_config=config_lien())
+
+
+def sous_onglet_manquantes(orgunit_id, debut, fin):
+    st.caption(
+        "Repère les formulaires marqués comme complétés (soumis) dans lesquels certains éléments "
+        "de données n'ont aucune valeur. Un élément est considéré comme renseigné dès qu'une valeur "
+        "existe (zéro compris), quelle que soit sa combinaison de catégories."
+    )
+    choix = st.multiselect(
+        "Formulaires à analyser",
+        options=df_ds["id"].tolist(),
+        format_func=lambda i: noms_ds.get(i, i),
+        key="vm_ds",
+    )
+
+    if st.button(
+        "🕳️ Rechercher les valeurs manquantes",
+        type="primary",
+        disabled=not (choix and orgunit_id and debut <= fin),
+        key="vm_go",
+    ):
+        try:
+            de_ds, noms_de, noms_formulaires = elements_et_formulaires(url, mode, user, password, token)
+        except Exception as e:
+            st.error(f"Impossible de lire les métadonnées (formulaires, éléments) : {e}")
+            return
+        ds_de = {}
+        for de, dss in de_ds.items():
+            for d in dss:
+                ds_de.setdefault(d, []).append(de)
+
+        lignes, details, erreurs, analysees = [], [], [], 0
+        barre = st.progress(0.0, text="Analyse en cours…")
+        for i, ds_id in enumerate(choix):
+            nom = noms_ds.get(ds_id, ds_id)
+            barre.progress(i / len(choix), text=f"Formulaire : {nom}")
+            elements = sorted(ds_de.get(ds_id, []), key=lambda d: noms_de.get(d, d))
+            if not elements:
+                erreurs.append(f"{nom} : aucun élément de données dans ce formulaire.")
+                continue
+            try:
+                subs = soumissions_formulaire(
+                    url, mode, user, password, token, ds_id, orgunit_id, debut.isoformat(), fin.isoformat()
+                )
+                vals = valeurs_saisies(
+                    url, mode, user, password, token, ds_id, orgunit_id, debut.isoformat(), fin.isoformat()
+                )
+            except Exception as e:
+                erreurs.append(f"{nom} : {e}")
+                continue
+            analysees += len(subs)
+            l, d = calculer_manquantes(subs, vals, elements, noms_de, nom, ds_id, noms_ou)
+            lignes += l
+            details += d
+        barre.empty()
+        st.session_state["vm_result"] = {
+            "lignes": lignes,
+            "details": details,
+            "erreurs": erreurs,
+            "analysees": analysees,
+            "unite": noms_ou.get(orgunit_id, orgunit_id),
+            "periode": f"{debut.isoformat()} → {fin.isoformat()}",
+        }
+
+    res = st.session_state.get("vm_result")
     if not res:
         return
     if res["erreurs"]:
         st.warning(
-            "Analyse impossible pour certains groupes (droits insuffisants ou erreur serveur) :\n\n"
+            "Analyse impossible pour certains formulaires (droits insuffisants ou erreur serveur) :\n\n"
             + "\n\n".join(res["erreurs"])
         )
-    if not res["resume"]:
+    st.subheader(f"Valeurs manquantes : {res['unite']} ({res['periode']})")
+    if res["analysees"] == 0:
+        st.info("Aucun formulaire soumis (complété) trouvé pour ces paramètres.")
         return
-
-    st.subheader(f"Résultats : {res['unite']} ({res['periode']})")
-    df_resume = pd.DataFrame(res["resume"])
-    total = int(df_resume["Erreurs détectées"].sum())
-    st.metric("Erreurs à corriger (tous groupes)", f"{total:,}".replace(",", " "))
-    st.dataframe(df_resume, hide_index=True, use_container_width=True)
-
     if not res["lignes"]:
-        st.success("Aucune erreur détectée par les règles de validation sélectionnées. ✅")
+        st.success(
+            f"Les {res['analysees']} formulaire(s) soumis sont entièrement renseignés. ✅"
+        )
         return
 
     df = pd.DataFrame(res["lignes"])
-    df["_o"] = df["Importance"].map(ORDRE_IMPORTANCE).fillna(3)
-    df = df.sort_values(["Groupe", "_o", "Règle", "Unité d'organisation", "Période"]).drop(columns="_o")
+    det = pd.DataFrame(res["details"])
+    with st.expander("🔎 Filtres", expanded=True):
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            sel_fo = filtre_multi("Formulaire", sorted(df["Formulaire"].unique()), "vm_f_fo")
+        with f2:
+            sel_ou = filtre_multi("Unité d'organisation", sorted(df["Unité d'organisation"].unique()), "vm_f_ou")
+        with f3:
+            sel_pe = filtre_multi("Période", sorted(df["Période"].unique()), "vm_f_pe")
+        with f4:
+            sel_vide = filtre_multi("Formulaire vide", ["Oui", "Non"], "vm_f_vide")
+    for col, sel in (("Formulaire", sel_fo), ("Unité d'organisation", sel_ou), ("Période", sel_pe),
+                     ("Formulaire vide", sel_vide)):
+        if sel:
+            df = df[df[col].isin(sel)]
+    if df.empty:
+        st.info("Aucun résultat ne correspond aux filtres choisis.")
+        return
+    cles = ["Formulaire", "Unité d'organisation", "Période"]
+    det = det.merge(df[cles].drop_duplicates(), on=cles)
 
-    st.download_button(
-        "⬇️ Télécharger toutes les erreurs (CSV)",
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Formulaires soumis analysés", f"{res['analysees']:,}".replace(",", " "))
+    m2.metric(
+        "Soumis avec éléments manquants",
+        f"{len(df):,}".replace(",", " "),
+        help="Compte les formulaires correspondant aux filtres.",
+    )
+    m3.metric("Soumis mais vides", int((df["Formulaire vide"] == "Oui").sum()))
+
+    st.markdown("### Synthèse")
+    c1, c2 = st.columns(2)
+    with c1:
+        graphique_compte(det, "Élément de données manquant", "Éléments de données les plus souvent manquants (top 10)")
+    with c2:
+        graphique_compte(det, "Unité d'organisation", "Unités avec le plus d'éléments manquants (top 10)")
+    c3, c4 = st.columns(2)
+    with c3:
+        graphique_compte(
+            df, "Période", "Formulaires incomplets par période", ordre="libelle", vertical=True
+        )
+    with c4:
+        graphique_compte(df, "Formulaire", "Formulaires incomplets par formulaire")
+
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "⬇️ Télécharger la liste des formulaires (CSV)",
         data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="dhis2_erreurs_validation.csv",
+        file_name="dhis2_valeurs_manquantes.csv",
         mime="text/csv",
     )
+    d2.download_button(
+        "⬇️ Télécharger le détail par élément (CSV)",
+        data=det.to_csv(index=False).encode("utf-8-sig"),
+        file_name="dhis2_valeurs_manquantes_detail.csv",
+        mime="text/csv",
+    )
+    st.markdown("### Détail : formulaires soumis avec éléments manquants")
+    st.dataframe(
+        df.sort_values(["Taux de renseignement (%)", "Unité d'organisation", "Période"]),
+        hide_index=True,
+        use_container_width=True,
+        height=500,
+        column_config=config_lien(),
+    )
 
-    # Un tableau par groupe de règles de validation
-    for ligne in res["resume"]:
-        groupe = ligne["Groupe"]
-        sous = df[df["Groupe"] == groupe].drop(columns="Groupe")
-        if sous.empty:
-            st.markdown(f"#### {groupe}")
-            st.caption("✅ Aucune erreur dans ce groupe.")
-            continue
-        with st.expander(f"❌ {groupe} : {len(sous)} erreur(s)", expanded=True):
-            st.dataframe(sous, hide_index=True, use_container_width=True, height=min(500, 40 + 35 * len(sous)))
+
+def onglet_qualite():
+    st.caption(
+        "Contrôle la qualité des données sur l'unité d'organisation et la période choisies "
+        "(unités descendantes comprises)."
+    )
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        orgunit_id = choisir_unite("qd")
+    with col2:
+        debut = st.date_input("Début de la période", value=datetime.date(annee_fin, 1, 1), key="qd_debut")
+    with col3:
+        fin = st.date_input("Fin de la période", value=datetime.date.today(), key="qd_fin")
+    if debut > fin:
+        st.warning("La date de début doit précéder la date de fin.")
+    st.caption("⚠️ Sur une grande unité (pays, région) et une longue période, l'analyse peut être longue.")
+
+    sous_val, sous_ab, sous_vm = st.tabs(
+        ["📋 Règles de validation", "📈 Valeurs aberrantes", "🕳️ Valeurs manquantes"]
+    )
+    with sous_val:
+        sous_onglet_validation(orgunit_id, debut, fin)
+    with sous_ab:
+        sous_onglet_aberrantes(orgunit_id, debut, fin)
+    with sous_vm:
+        sous_onglet_manquantes(orgunit_id, debut, fin)
 
 
-tab_ext, tab_comp, tab_qd = st.tabs(["📥 Extraction", "✅ Complétude", "🔍 Qualité des données"])
+# ------------------------------------------------------------------
+# Onglet 4 : tableaux de bord
+# ------------------------------------------------------------------
+def onglet_dashboard():
+    st.caption(
+        "Charge les tableaux croisés d'un tableau de bord DHIS2 : la requête enregistrée de chaque "
+        "tableau est relancée avec les données actuelles."
+    )
+    c1, c2 = st.columns([2, 2])
+    with c1:
+        dashboard_id = st.text_input("ID du tableau de bord", value="GU65zFQh5WH", key="db_id").strip()
+    with c2:
+        inclure = st.checkbox(
+            "Inclure aussi les graphiques (leurs données sous forme de tableau)", value=False, key="db_graphiques"
+        )
+    if st.button("📥 Charger les tableaux", type="primary", disabled=not dashboard_id, key="db_go"):
+        try:
+            with st.spinner("Chargement du tableau de bord…"):
+                st.session_state["db_result"] = charger_tableaux_dashboard(dashboard_id, inclure)
+        except Exception as e:
+            st.session_state.pop("db_result", None)
+            st.error(
+                f"Impossible de charger le tableau de bord (ID incorrect, droits insuffisants ou erreur serveur) : {e}"
+            )
+
+    res = st.session_state.get("db_result")
+    if not res:
+        return
+    st.subheader(f"{res['nom']}")
+    st.caption(f"{len(res['tables'])} tableau(x) chargé(s).")
+    if res["erreurs"]:
+        st.warning("Tableaux non chargés :\n\n" + "\n\n".join(res["erreurs"]))
+    if res["autres"]:
+        with st.expander(f"Autres éléments du tableau de bord, non chargés ({len(res['autres'])})"):
+            st.write("\n".join(f"- {a}" for a in res["autres"]))
+    for t in res["tables"]:
+        with st.expander(f"📋 {t['nom']}", expanded=len(res["tables"]) <= 3):
+            if t["df"].empty:
+                st.info("Aucune donnée renvoyée pour ce tableau.")
+            else:
+                st.dataframe(t["df"], hide_index=True, use_container_width=True)
+            st.caption(
+                f"Type : {t['type']} · {t['nb_lignes_analytics']} ligne(s) renvoyée(s) par analytics · "
+                f"lignes : {', '.join(t['lignes']) or '–'} · colonnes : {', '.join(t['colonnes']) or '–'}"
+            )
+            with st.expander("Requête analytics utilisée"):
+                st.json(t["requete"])
+
+
+# ------------------------------------------------------------------
+# Onglet 5 : validation (tableaux du tableau de bord GU65zFQh5WH)
+# ------------------------------------------------------------------
+DASHBOARD_VALIDATION = "GU65zFQh5WH"
+MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+        "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+
+
+def onglet_validation():
+    st.caption(
+        "Charge les tableaux du tableau de bord de validation : la requête enregistrée de "
+        "chaque tableau est relancée avec les données actuelles, sur la période choisie."
+    )
+    try:
+        df_un = unites_avec_niveau(url, mode, user, password, token)
+        noms_niv = noms_niveaux(url, mode, user, password, token)
+    except Exception as e:
+        st.error(f"Impossible de lire les unités d'organisation : {e}")
+        return
+
+    # L'onglet Validation travaille exclusivement au niveau district (niveau 3).
+    districts = df_un[pd.to_numeric(df_un["level"], errors="coerce") == 3].sort_values("displayName")
+    if districts.empty:
+        st.warning("Aucun district (niveau 3) n'a été trouvé dans la hiérarchie DHIS2.")
+        return
+    noms_districts = dict(zip(districts["id"], districts["displayName"]))
+
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.markdown(f"**Tableau de bord** : `{DASHBOARD_VALIDATION}`")
+    with c2:
+        unite_val = st.selectbox(
+            "District",
+            options=districts["id"].tolist(),
+            format_func=lambda i: noms_districts[i],
+            key="val_unite",
+        )
+
+    c3, c4, c5 = st.columns([1, 1, 1])
+    with c3:
+        annees_val = sorted(st.multiselect(
+            "Année(s)", options=options_annees, default=[annee_fin], key="val_annees"
+        ))
+    with c4:
+        mois_val = sorted(st.multiselect(
+            "Mois", options=list(range(1, 13)), default=list(range(1, 13)),
+            format_func=lambda m: MOIS[m - 1], key="val_mois"
+        ))
+    with c5:
+        rafraichir = st.button("🔄 Rafraîchir", key="val_refresh", use_container_width=True)
+
+    if not annees_val:
+        st.warning("Sélectionnez au moins une année.")
+        return
+    # Périodes DHIS2 explicites : mensuelles (YYYYMM) si des mois sont choisis, annuelles sinon
+    periodes = (
+        [f"{a}{m:02d}" for a in annees_val for m in mois_val]
+        if mois_val
+        else [str(a) for a in annees_val]
+    )
+    signature = (tuple(annees_val), tuple(mois_val), unite_val)
+    if rafraichir or st.session_state.get("val_signature") != signature:
+        try:
+            with st.spinner("Chargement du tableau de bord de validation…"):
+                st.session_state["val_result"] = charger_tableaux_dashboard(
+                    DASHBOARD_VALIDATION, False, periodes=periodes,
+                    unites_ou=[unite_val], ou_mode="DESCENDANTS",
+                )
+            st.session_state["val_signature"] = signature
+        except Exception as e:
+            st.session_state.pop("val_result", None)
+            st.error(
+                "Impossible de charger le tableau de bord de validation "
+                f"(ID incorrect, droits insuffisants ou erreur serveur) : {e}"
+            )
+
+    res = st.session_state.get("val_result")
+    if not res:
+        return
+    st.subheader(f"{res['nom']}")
+    nom_unite = noms_districts.get(unite_val, unite_val)
+    libelle_mois = ", ".join(MOIS[m - 1] for m in mois_val) if mois_val else "année(s) complète(s)"
+    st.caption(
+        f"{len(res['tables'])} tableau(x) chargé(s) · district : {nom_unite} (structures enfants incluses) · période : "
+        f"{', '.join(map(str, annees_val))} · {libelle_mois}"
+    )
+    if res["erreurs"]:
+        st.warning("Tableaux non chargés :\n\n" + "\n\n".join(res["erreurs"]))
+    if res["autres"]:
+        with st.expander(f"Autres éléments du tableau de bord, non chargés ({len(res['autres'])})"):
+            st.write("\n".join(f"- {a}" for a in res["autres"]))
+    for t in res["tables"]:
+        with st.expander(f"📋 {t['nom']}", expanded=len(res["tables"]) <= 3):
+            if t["df"].empty:
+                st.info("Aucune donnée renvoyée pour ce tableau.")
+            else:
+                st.dataframe(t["df"], hide_index=True, use_container_width=True)
+            st.caption(
+                f"Type : {t['type']} · {t['nb_lignes_analytics']} ligne(s) renvoyée(s) par analytics · "
+                f"lignes : {', '.join(t['lignes']) or '–'} · colonnes : {', '.join(t['colonnes']) or '–'}"
+            )
+            with st.expander("Requête analytics utilisée"):
+                st.json(t["requete"])
+
+
+tab_ext, tab_comp, tab_qd, tab_db, tab_val = st.tabs(
+    ["📥 Extraction", "✅ Complétude", "🔍 Qualité des données", "📊 Tableaux de bord", "🧪 Validation"]
+)
 with tab_ext:
     onglet_extraction()
 with tab_comp:
     onglet_completude()
 with tab_qd:
     onglet_qualite()
+with tab_db:
+    onglet_dashboard()
+with tab_val:
+    onglet_validation()
