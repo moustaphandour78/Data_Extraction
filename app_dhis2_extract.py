@@ -1,8 +1,9 @@
 """
-V2
+V4
 Application Streamlit : extraction de données DHIS2
 (un formulaire x une unité d'organisation x N dernières années)
-Quatre onglets indépendants : « Extraction », « Complétude », « Qualité des données » et « Tableaux de bord ».
+Quatre onglets indépendants : « Extraction », « Complétude », « Qualité des données » et
+« Validation » (consignes de validation 2020 appliquées aux tableaux du tableau de bord).
 Les données extraites sont agrégées par année : pour chaque élément de données, on cumule
 toutes les combinaisons de catégories (categoryOptionCombo).
 
@@ -19,8 +20,11 @@ import datetime
 import math
 import os
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -791,16 +795,43 @@ def requete_analytics(viz: dict, periodes: list = None, unites_ou: list = None) 
     filtres = [dimension(o) for o in viz.get("filters", []) or []]
     if filtres:
         params["filter"] = filtres
-    if periodes is not None and not any(d.startswith("pe") for d in params["dimension"]):
+    deja = [d.split(":")[0] for d in params["dimension"] + params.get("filter", [])]
+    if periodes is not None and "pe" not in deja:
         # la visualisation ne porte pas de dimension « période » : on filtre quand même
         params.setdefault("filter", []).append("pe:" + ";".join(periodes))
-    if unites_ou is not None and not any(d.startswith("ou") for d in params["dimension"]):
+    if unites_ou is not None and "ou" not in deja:
         params.setdefault("filter", []).append("ou:" + ";".join(unites_ou))
     return {"params": params, "lignes": lignes, "colonnes": colonnes}
 
 
-def construire_tableau(rep: dict, lignes: list, colonnes: list) -> pd.DataFrame:
-    """Tableau croisé (lignes x colonnes) à partir d'une réponse analytics."""
+DIMS_HORS = {"value", "numerator", "denominator", "factor", "multiplier", "divisor"}
+
+
+def dims_de(rep: dict) -> list:
+    """Dimensions (dx, pe, ou, co…) présentes dans la réponse analytics, dans l'ordre des en-têtes."""
+    return [h["name"] for h in rep["headers"] if h["name"] not in DIMS_HORS]
+
+
+def _pivoter(df: pd.DataFrame, col: str, lignes: list, colonnes: list, agg: str) -> pd.DataFrame:
+    if lignes and colonnes:
+        return df.pivot_table(index=lignes, columns=colonnes, values=col, aggfunc=agg, observed=True)
+    if lignes:
+        return df.groupby(lignes, observed=True)[col].agg(agg).to_frame("Valeur")
+    if colonnes:
+        return df.groupby(colonnes, observed=True)[col].agg(agg).to_frame("Valeur").T
+    return df[[col]].rename(columns={col: "Valeur"})
+
+
+def _aplatir_colonnes(t: pd.DataFrame) -> list:
+    if isinstance(t.columns, pd.MultiIndex):
+        return [" | ".join(str(x) for x in c) for c in t.columns]
+    return [str(c) for c in t.columns]
+
+
+def _construire(rep: dict, lignes: list, colonnes: list, erreurs=None) -> tuple:
+    """Tableau croisé (lignes x colonnes) à partir d'une réponse analytics, et masque booléen
+    (même forme) des cellules signalées en erreur. `erreurs` : ensemble de clés, chaque clé étant
+    le tuple des noms de toutes les dimensions de la cellule (dans l'ordre des en-têtes)."""
     df = pd.DataFrame(rep.get("rows", []), columns=[h["name"] for h in rep["headers"]])
     meta = rep.get("metaData", {}) or {}
     items, dims_meta = meta.get("items", {}) or {}, meta.get("dimensions", {}) or {}
@@ -809,32 +840,40 @@ def construire_tableau(rep: dict, lignes: list, colonnes: list) -> pd.DataFrame:
     lignes = [d for d in lignes if d in df.columns]
     colonnes = [d for d in colonnes if d in df.columns]
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    dims = dims_de(rep)
+    if erreurs and dims:
+        cles = list(zip(*[df[d].map(nom) for d in dims]))
+        df["_m"] = [int(c in erreurs) for c in cles]
+    else:
+        df["_m"] = 0
     for dim in lignes + colonnes:
         ordre = [nom(i) for i in dims_meta.get(dim, list(df[dim].unique()))]
         df[dim] = pd.Categorical(df[dim].map(nom), categories=list(dict.fromkeys(ordre)), ordered=True)
 
-    if lignes and colonnes:
-        t = df.pivot_table(index=lignes, columns=colonnes, values="value", aggfunc="first", observed=True)
-    elif lignes:
-        t = df.groupby(lignes, observed=True)["value"].first().to_frame("Valeur")
-    elif colonnes:
-        t = df.groupby(colonnes, observed=True)["value"].first().to_frame("Valeur").T
-    else:
-        t = df[["value"]].rename(columns={"value": "Valeur"})
-    if isinstance(t.columns, pd.MultiIndex):
-        t.columns = [" | ".join(str(x) for x in c) for c in t.columns]
-    else:
-        t.columns = [str(c) for c in t.columns]
+    t = _pivoter(df, "value", lignes, colonnes, "first")
+    m = _pivoter(df, "_m", lignes, colonnes, "max").reindex(index=t.index, columns=t.columns)
+    m = m.fillna(0).astype(bool)
+    t.columns = _aplatir_colonnes(t)
+    m.columns = t.columns
+    n_lab = 0
     if lignes:
         t.index = t.index.set_names([libelle(d) for d in lignes])
         t = t.reset_index()
-    return t
+        n_lab = len(lignes)
+    masque = pd.DataFrame(False, index=t.index, columns=t.columns)
+    masque.iloc[:, n_lab:] = m.to_numpy()
+    return t, masque
+
+
+def construire_tableau(rep: dict, lignes: list, colonnes: list) -> pd.DataFrame:
+    """Tableau croisé (lignes x colonnes) à partir d'une réponse analytics."""
+    return _construire(rep, lignes, colonnes)[0]
 
 
 def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, periodes: list = None,
-                               unites_ou: list = None, ou_mode: str = None) -> dict:
+                               unites_ou: list = None) -> dict:
     """Charge les tableaux d'un tableau de bord : (a) définition des éléments, (b) définition
     de chaque visualisation, (c) données via analytics, reconstruites en tableau croisé."""
     s = make_session(mode, user, password, token)
@@ -875,10 +914,7 @@ def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, peri
             rv.raise_for_status()
             viz = rv.json()
             q = requete_analytics(viz, periodes, unites_ou)
-            params_analytics = dict(q["params"])
-            if ou_mode:
-                params_analytics["ouMode"] = ou_mode
-            ra = s.get(f"{url}/analytics.json", params=params_analytics, timeout=300)
+            ra = s.get(f"{url}/analytics.json", params=q["params"], timeout=300)
             ra.raise_for_status()
             rep = ra.json()
             t = construire_tableau(rep, q["lignes"], q["colonnes"])
@@ -892,6 +928,7 @@ def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, peri
                     "colonnes": q["colonnes"],
                     "requete": q["params"],
                     "nb_lignes_analytics": len(rep.get("rows", [])),
+                    "rep": rep,
                 }
             )
         except Exception as e:
@@ -1949,56 +1986,315 @@ def onglet_qualite():
 
 
 # ------------------------------------------------------------------
-# Onglet 4 : tableaux de bord
+# Consignes de validation 2020 (fichier consigne.md) : règles appliquées aux tableaux
 # ------------------------------------------------------------------
-def onglet_dashboard():
-    st.caption(
-        "Charge les tableaux croisés d'un tableau de bord DHIS2 : la requête enregistrée de chaque "
-        "tableau est relancée avec les données actuelles."
-    )
-    c1, c2 = st.columns([2, 2])
-    with c1:
-        dashboard_id = st.text_input("ID du tableau de bord", value="GU65zFQh5WH", key="db_id").strip()
-    with c2:
-        inclure = st.checkbox(
-            "Inclure aussi les graphiques (leurs données sous forme de tableau)", value=False, key="db_graphiques"
+COULEUR_ERREUR = "#F6FA8F"  # jaune des cellules en erreur
+TOLERANCE = 1e-6
+
+
+def normaliser(texte) -> str:
+    """Minuscules, sans accents ni ponctuation (pour comparer des libellés)."""
+    t = unicodedata.normalize("NFKD", str(texte)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", t).strip()
+
+
+def E(inc: list, exc: list = ()) -> dict:
+    """Élément de donnée recherché dans les libellés : toutes les expressions de `inc`
+    doivent correspondre, aucune de `exc` (expressions régulières sur le libellé normalisé)."""
+    return {"inc": inc, "exc": list(exc)}
+
+
+_NN = r"nouveau\s*nes?"
+_ACC_STRUCTURE = E(
+    [r"accouchements?", r"structure|formation sanitaire"],
+    [r"assist|qualifi|partogramme|gatpa|domicile|nouveau"],
+)
+_VIVANTS = E(
+    [_NN, r"vivants?"],
+    [r"poids|kangourou|soins|sein|risque|\bcrie\b|antibio|paquet|mort"],
+)
+_CPON1 = r"(cpon|post\s*natales?)\s*1\b"
+_CPON3 = r"(cpon|post\s*natales?)\s*3\b"
+_CURATIF = {
+    "elements": {
+        "consultations": E([r"\bconsultations?\b"], [r"consultant"]),
+        "consultants": E([r"\bconsultants?\b"]),
+    },
+    "regles": [("Consultations ≥ Consultants", "ge", ["consultations"], ["consultants"])],
+}
+
+# Chaque consigne : titre, éléments recherchés et règles (libellé, opérateur, éléments à gauche
+# (additionnés), éléments à droite (additionnés)). Opérateurs : ge (≥), le (≤), eq (=).
+REGLES_2020 = {
+    1: {"titre": "Validation 2020 Activités curatives du centre de santé", **_CURATIF},
+    2: {"titre": "Validation 2020 Activités curatives du poste de santé", **_CURATIF},
+    3: {
+        "titre": "Validation 2020 CPN/FER/MILDA",
+        "elements": {
+            "cpn1": E(
+                [r"(premiers?\s+contacts?.*cpn|cpn.*premiers?\s+contacts?|\bcpn\s*1\b)"],
+                [r"milda|moustiquaire|\bfer\b|folique"],
+            ),
+            "milda": E([r"milda|moustiquaire"]),
+            "fer": E([r"\bfer\b|folique"]),
+        },
+        "regles": [
+            ("Premiers contacts CPN ≥ femmes enceintes avec prescription de MILDA", "ge", ["cpn1"], ["milda"]),
+            ("Premiers contacts CPN ≥ femmes enceintes avec prescription de fer/acide folique", "ge", ["cpn1"], ["fer"]),
+        ],
+    },
+    4: {
+        "titre": "Validation 2020 CPN4/ayant fait 4CPN/selon les normes",
+        "elements": {
+            "cpn4": E([r"\bcpn\s*4\b"], [r"norme", r"ayant|effectue"]),
+            "quatre_cpn": E(
+                [r"((ayant|effectue).*(\b4|quatre)\s*cpn|(\b4|quatre)\s*cpn.*(ayant|effectue))"], [r"norme"]
+            ),
+            "normes": E([r"(\b4|quatre)\s*cpn|cpn\s*4", r"norme"]),
+        },
+        "regles": [
+            ("CPN 4 ≥ femmes ayant effectué les 4 CPN", "ge", ["cpn4"], ["quatre_cpn"]),
+            ("Femmes ayant effectué les 4 CPN ≥ 4 CPN selon les normes", "ge", ["quatre_cpn"], ["normes"]),
+        ],
+    },
+    5: {
+        "titre": "Validation 2020 ACC/PART/GATPA",
+        "elements": {
+            "acc_structure": _ACC_STRUCTURE,
+            "assistes": E([r"accouchements?", r"assist", r"qualifi"], [r"partogramme|gatpa"]),
+            "partogramme": E([r"partogramme"]),
+            "gatpa": E([r"gatpa"]),
+        },
+        "regles": [
+            ("Accouchements dans la structure ≥ accouchements assistés par personnel qualifié", "ge", ["acc_structure"], ["assistes"]),
+            ("Accouchements assistés ≥ accouchements avec partogramme", "ge", ["assistes"], ["partogramme"]),
+            ("Accouchements assistés ≥ accouchements sous GATPA", "ge", ["assistes"], ["gatpa"]),
+        ],
+    },
+    6: {
+        "titre": "Validation 2020 ACC/Nouveau-nés",
+        "elements": {
+            "acc_structure": _ACC_STRUCTURE,
+            "acc_domicile": E([r"accouchements?", r"domicile"], [r"nouveau"]),
+            "total_nn": E([r"total", _NN], [r"vivants?|mort|poids|kangourou|risque|soins|sein"]),
+            "total_mort_nes": E([r"total", r"mort\s*nes?"], [r"frais|macer"]),
+            "mort_nes_frais": E([r"mort\s*nes?", r"frais"]),
+            "mort_nes_macere": E([r"mort\s*nes?", r"macer"]),
+        },
+        "regles": [
+            ("Accouchements (structure + domicile vus) = total nouveau-nés", "eq", ["acc_structure", "acc_domicile"], ["total_nn"]),
+            ("Total mort-nés = mort-nés frais + mort-nés macérés", "eq", ["total_mort_nes"], ["mort_nes_frais", "mort_nes_macere"]),
+        ],
+    },
+    7: {
+        "titre": "Validation 2020 Nouveau-nés/Poids",
+        "elements": {
+            "total_vivants": E([r"total", r"nouveaux?\s*nes?", r"vivants?"], [r"repartition|poids"]),
+            "total_poids": E([r"total", r"repartition", r"poids"]),
+        },
+        "regles": [
+            (
+                "R20_Total Nouveaux-nés vivants == R20_Total répartition des poids",
+                "eq",
+                ["total_vivants"],
+                ["total_poids"],
+            )
+        ],
+    },
+    8: {
+        "titre": "Validation 2020 Nouveau-nés/K/5M/A",
+        "elements": {
+            "kangourou_eligibles": E([r"kangourou", r"eligibles?"]),
+            "kangourou_soins": E([r"kangourou", r"benefici|soins"], [r"eligible"]),
+            "poids_1500_2499": E([r"1500", r"2499"], [r"kangourou"]),
+            "vivants": _VIVANTS,
+            "paquet": E([r"paquet|5 elements|cinq elements"], [r"sein"]),
+            "sein": E([r"sein"], [r"paquet"]),
+            "risque_infectieux": E([r"risque infectieux"], [r"antibio"]),
+            "antibio": E([r"antibio"]),
+            "pas_crie": E([r"pas\s+crie"], [r"reanim"]),
+            "reanimes": E([r"reanim"]),
+        },
+        "regles": [
+            ("Kangourou éligibles ≤ nouveau-nés de 1500 à 2499 g", "le", ["kangourou_eligibles"], ["poids_1500_2499"]),
+            ("Kangourou éligibles = nouveau-nés avec soins kangourou", "eq", ["kangourou_eligibles"], ["kangourou_soins"]),
+            ("Nouveau-nés vivants ≥ paquet de soins immédiats (5 éléments)", "ge", ["vivants"], ["paquet"]),
+            ("Nouveau-nés vivants ≥ mise au sein précoce", "ge", ["vivants"], ["sein"]),
+            ("Mise au sein précoce ≥ paquet de soins immédiats (5 éléments)", "ge", ["sein"], ["paquet"]),
+            ("Risque infectieux ≥ traitement antibiotique", "ge", ["risque_infectieux"], ["antibio"]),
+            ("Nouveau-nés n'ayant pas crié = dont réanimés", "eq", ["pas_crie"], ["reanimes"]),
+        ],
+    },
+    9: {
+        "titre": "Validation 2020 CPON",
+        "elements": {
+            "cpon1": E([_CPON1], [r"dont|\bj\s*1|\bj1"]),
+            "cpon1_j1j3": E([_CPON1, r"\bj\s*1|\bj1"]),
+            "cpon3": E([_CPON3], [r"dont|\bj\s*42|\bj42|accouchees?|total"]),
+            "cpon3_j42": E([_CPON3, r"\bj\s*42|\bj42"]),
+            "acc_3_cpon": E([r"accouchees?", r"\b3\b|trois"], [r"au moins"]),
+            "acc_1_cpon": E([r"accouchees?", r"au moins"]),
+        },
+        "regles": [
+            ("CPoN 1 ≥ CPoN 1 dont J1-J3", "ge", ["cpon1"], ["cpon1_j1j3"]),
+            ("CPoN 3 ≥ CPoN 3 dont J42", "ge", ["cpon3"], ["cpon3_j42"]),
+            ("CPoN 3 ≥ accouchées ayant effectué 3 CPoN", "ge", ["cpon3"], ["acc_3_cpon"]),
+            ("Accouchées avec 3 CPoN ≤ accouchées avec au moins une CPoN", "le", ["acc_3_cpon"], ["acc_1_cpon"]),
+        ],
+    },
+    10: {
+        "titre": "Validation 2020 Décès maternels/Selon les causes",
+        "elements": {
+            "total_deces": E([r"deces\s+maternels?"], [r"direct|cause|complication"]),
+            "causes": E([r"direct"]),
+        },
+        "regles": [("Total décès maternels = causes directes + indirectes", "eq", ["total_deces"], ["causes"])],
+    },
+    11: {
+        "titre": "Validation 2020 Survie de l'enfant/Morbidité 0-59 mois",
+        "elements": {},
+        "regles": [],
+        "manuel": "Comparaison, affection par affection, entre le formulaire de santé de l'enfant et le "
+                  "formulaire Morbidité/mortalité (0-59 mois) : nécessite les libellés des deux formulaires.",
+    },
+    12: {
+        "titre": "Validation 2020 Morbidité",
+        "elements": {},
+        "regles": [],
+        "manuel": "Confirmation ou infirmation de cas de maladies sous surveillance ou éradiquées : "
+                  "vérification manuelle (liste des maladies à préciser pour automatiser).",
+    },
+}
+SYMBOLES_OP = {"ge": "≥", "le": "≤", "eq": "="}
+
+
+def trouver_consigne(nom_table: str):
+    """Numéro de la consigne dont le titre correspond au nom du tableau (ou None)."""
+    n = normaliser(nom_table)
+    meilleur, score = None, 0.0
+    for num, c in REGLES_2020.items():
+        t = normaliser(c["titre"])
+        if n == t:
+            return num
+        s = 1 + len(t) / 1000 if t in n else SequenceMatcher(None, n, t).ratio()
+        if s > score:
+            meilleur, score = num, s
+    return meilleur if score >= 0.8 else None
+
+
+def tableau_long(rep: dict) -> tuple:
+    """Réponse analytics -> (DataFrame long avec les noms de toutes les dimensions + value, dimensions)."""
+    dims = dims_de(rep)
+    df = pd.DataFrame(rep.get("rows", []), columns=[h["name"] for h in rep["headers"]])
+    if df.empty:
+        return df, dims
+    items = (rep.get("metaData", {}) or {}).get("items", {}) or {}
+    nom = lambda i: (items.get(i) or {}).get("name", i)
+    for d in dims:
+        df[d] = df[d].map(nom)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    return df[dims + ["value"]], dims
+
+
+def evaluer_regles(rep: dict, consigne: dict) -> dict:
+    """Applique les règles d'une consigne à une réponse analytics.
+    Renvoie {"erreurs": clés des cellules en erreur, "details": une ligne par erreur,
+    "diagnostic": une ligne par règle (appliquée ou non)}."""
+    sortie = {"erreurs": set(), "details": [], "diagnostic": []}
+    if consigne.get("manuel"):
+        sortie["diagnostic"].append(
+            {"Règle": consigne["titre"], "Statut": "Non automatisée : " + consigne["manuel"],
+             "Libellés (gauche)": "", "Libellés (droite)": "", "Erreurs": 0}
         )
-    if st.button("📥 Charger les tableaux", type="primary", disabled=not dashboard_id, key="db_go"):
-        try:
-            with st.spinner("Chargement du tableau de bord…"):
-                st.session_state["db_result"] = charger_tableaux_dashboard(dashboard_id, inclure)
-        except Exception as e:
-            st.session_state.pop("db_result", None)
-            st.error(
-                f"Impossible de charger le tableau de bord (ID incorrect, droits insuffisants ou erreur serveur) : {e}"
-            )
+        return sortie
+    long, dims = tableau_long(rep)
+    if long.empty or "dx" not in dims:
+        sortie["diagnostic"].append(
+            {"Règle": consigne["titre"], "Statut": "Non appliquée : aucune donnée ou dimension « données » absente",
+             "Libellés (gauche)": "", "Libellés (droite)": "", "Erreurs": 0}
+        )
+        return sortie
 
-    res = st.session_state.get("db_result")
-    if not res:
-        return
-    st.subheader(f"{res['nom']}")
-    st.caption(f"{len(res['tables'])} tableau(x) chargé(s).")
-    if res["erreurs"]:
-        st.warning("Tableaux non chargés :\n\n" + "\n\n".join(res["erreurs"]))
-    if res["autres"]:
-        with st.expander(f"Autres éléments du tableau de bord, non chargés ({len(res['autres'])})"):
-            st.write("\n".join(f"- {a}" for a in res["autres"]))
-    for t in res["tables"]:
-        with st.expander(f"📋 {t['nom']}", expanded=len(res["tables"]) <= 3):
-            if t["df"].empty:
-                st.info("Aucune donnée renvoyée pour ce tableau.")
-            else:
-                st.dataframe(t["df"], hide_index=True, use_container_width=True)
-            st.caption(
-                f"Type : {t['type']} · {t['nb_lignes_analytics']} ligne(s) renvoyée(s) par analytics · "
-                f"lignes : {', '.join(t['lignes']) or '–'} · colonnes : {', '.join(t['colonnes']) or '–'}"
+    libelles = list(dict.fromkeys(long["dx"]))
+    norm = {l: normaliser(l) for l in libelles}
+    trouves = {
+        cle: [
+            l for l in libelles
+            if all(re.search(p, norm[l]) for p in spec["inc"])
+            and not any(re.search(p, norm[l]) for p in spec["exc"])
+        ]
+        for cle, spec in consigne["elements"].items()
+    }
+    groupe = [d for d in dims if d != "dx"]
+    if groupe:
+        wide = long.pivot_table(index=groupe, columns="dx", values="value", aggfunc="sum")
+    else:
+        wide = long.assign(_g="_").pivot_table(index="_g", columns="dx", values="value", aggfunc="sum")
+
+    for libelle, op, gauche, droite in consigne["regles"]:
+        lg = [l for k in gauche for l in trouves.get(k, []) if l in wide.columns]
+        ld = [l for k in droite for l in trouves.get(k, []) if l in wide.columns]
+        introuvables = [k for k in gauche + droite if not any(l in wide.columns for l in trouves.get(k, []))]
+        diag = {"Règle": libelle, "Statut": "Appliquée", "Libellés (gauche)": " | ".join(lg),
+                "Libellés (droite)": " | ".join(ld), "Erreurs": 0}
+        if introuvables:
+            diag["Statut"] = "Non appliquée : éléments introuvables (" + ", ".join(introuvables) + ")"
+            sortie["diagnostic"].append(diag)
+            continue
+        L = wide[lg].sum(axis=1, min_count=1)
+        R = wide[ld].sum(axis=1, min_count=1)
+        presentes = L.notna() | R.notna()
+        L, R = L.fillna(0), R.fillna(0)
+        if op == "ge":
+            viol = (R - L) > TOLERANCE
+        elif op == "le":
+            viol = (L - R) > TOLERANCE
+        else:
+            viol = (L - R).abs() > TOLERANCE
+        viol = viol & presentes
+        for idx in viol[viol].index:
+            g = idx if isinstance(idx, tuple) else (idx,)
+            valeurs_groupe = dict(zip(groupe, g)) if groupe else {}
+            for l in lg + ld:  # toutes les cellules concernées par la règle non respectée
+                sortie["erreurs"].add(
+                    tuple(l if d == "dx" else valeurs_groupe.get(d) for d in dims)
+                )
+            ligne = {LIBELLES_DIMENSIONS.get(d, d): v for d, v in valeurs_groupe.items()}
+            ligne.update(
+                {"Règle": libelle, "Condition": f"gauche {SYMBOLES_OP[op]} droite",
+                 "Valeur gauche": float(L[idx]), "Valeur droite": float(R[idx])}
             )
-            with st.expander("Requête analytics utilisée"):
-                st.json(t["requete"])
+            sortie["details"].append(ligne)
+        diag["Erreurs"] = int(viol.sum())
+        sortie["diagnostic"].append(diag)
+    return sortie
+
+
+def fmt_nombre(v) -> str:
+    if pd.isna(v):
+        return "–"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{int(f):,}".replace(",", " ") if f.is_integer() else f"{f:.2f}".replace(".", ",")
+
+
+def styler_erreurs(t: pd.DataFrame, masque: pd.DataFrame):
+    """Tableau mis en forme : cellules en erreur sur fond jaune (#F6FA8F)."""
+    css = pd.DataFrame(
+        np.where(masque.to_numpy(), f"background-color: {COULEUR_ERREUR}; color: #000000", ""),
+        index=t.index, columns=t.columns,
+    )
+    cols_num = [c for c in t.columns if pd.api.types.is_numeric_dtype(t[c])]
+    sty = t.style.apply(lambda _: css, axis=None)
+    if cols_num:
+        sty = sty.format(fmt_nombre, subset=pd.IndexSlice[:, cols_num])
+    return sty
 
 
 # ------------------------------------------------------------------
-# Onglet 5 : validation (tableaux du tableau de bord GU65zFQh5WH)
+# Onglet 4 : validation (tableaux du tableau de bord GU65zFQh5WH)
 # ------------------------------------------------------------------
 DASHBOARD_VALIDATION = "GU65zFQh5WH"
 MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
@@ -2017,35 +2313,40 @@ def onglet_validation():
         st.error(f"Impossible de lire les unités d'organisation : {e}")
         return
 
-    # L'onglet Validation travaille exclusivement au niveau district (niveau 3).
-    districts = df_un[pd.to_numeric(df_un["level"], errors="coerce") == 3].sort_values("displayName")
-    if districts.empty:
-        st.warning("Aucun district (niveau 3) n'a été trouvé dans la hiérarchie DHIS2.")
-        return
-    noms_districts = dict(zip(districts["id"], districts["displayName"]))
-
-    c1, c2 = st.columns([2, 3])
+    c1, c2, c3 = st.columns([2, 1, 2])
     with c1:
         st.markdown(f"**Tableau de bord** : `{DASHBOARD_VALIDATION}`")
     with c2:
+        niveaux = sorted({int(l) for l in df_un["level"].dropna().unique()})
+        niveau = st.selectbox(
+            "Niveau",
+            options=niveaux,
+            format_func=lambda n: f"{n} · {noms_niv.get(n, 'Niveau ' + str(n))}",
+            key="val_niveau",
+        )
+    with c3:
+        sous_unites = df_un[df_un["level"] == niveau].sort_values("displayName")
+        noms_sous = dict(zip(sous_unites["id"], sous_unites["displayName"]))
         unite_val = st.selectbox(
-            "District",
-            options=districts["id"].tolist(),
-            format_func=lambda i: noms_districts[i],
+            "Unité d'organisation",
+            options=sous_unites["id"].tolist(),
+            format_func=lambda i: noms_sous[i],
             key="val_unite",
         )
 
-    c3, c4, c5 = st.columns([1, 1, 1])
-    with c3:
+    c4, c5, c6, c7 = st.columns([1, 1, 1, 1])
+    with c4:
         annees_val = sorted(st.multiselect(
             "Année(s)", options=options_annees, default=[annee_fin], key="val_annees"
         ))
-    with c4:
+    with c5:
         mois_val = sorted(st.multiselect(
             "Mois", options=list(range(1, 13)), default=list(range(1, 13)),
             format_func=lambda m: MOIS[m - 1], key="val_mois"
         ))
-    with c5:
+    with c6:
+        enfants = st.checkbox("Inclure les unités enfantes", value=True, key="val_enfants")
+    with c7:
         rafraichir = st.button("🔄 Rafraîchir", key="val_refresh", use_container_width=True)
 
     if not annees_val:
@@ -2057,13 +2358,20 @@ def onglet_validation():
         if mois_val
         else [str(a) for a in annees_val]
     )
-    signature = (tuple(annees_val), tuple(mois_val), unite_val)
+    # Structures enfants : analytics agrégé ignore `ouMode` ; il faut demander explicitement le niveau
+    # inférieur (ex. ou:LEVEL-4;UID = toutes les structures du niveau 4 situées sous l'unité choisie).
+    niveau_enfants = int(niveau) + 1
+    avec_enfants = bool(enfants) and niveau_enfants in niveaux
+    if enfants and not avec_enfants:
+        st.info("Cette unité n'a pas de niveau inférieur : seule l'unité elle-même est interrogée.")
+    unites_ou = [f"LEVEL-{niveau_enfants}", unite_val] if avec_enfants else [unite_val]
+    signature = (tuple(annees_val), tuple(mois_val), unite_val, avec_enfants)
     if rafraichir or st.session_state.get("val_signature") != signature:
         try:
             with st.spinner("Chargement du tableau de bord de validation…"):
                 st.session_state["val_result"] = charger_tableaux_dashboard(
                     DASHBOARD_VALIDATION, False, periodes=periodes,
-                    unites_ou=[unite_val], ou_mode="DESCENDANTS",
+                    unites_ou=unites_ou,
                 )
             st.session_state["val_signature"] = signature
         except Exception as e:
@@ -2077,10 +2385,14 @@ def onglet_validation():
     if not res:
         return
     st.subheader(f"{res['nom']}")
-    nom_unite = noms_districts.get(unite_val, unite_val)
+    nom_unite = noms_ou.get(unite_val, unite_val)
     libelle_mois = ", ".join(MOIS[m - 1] for m in mois_val) if mois_val else "année(s) complète(s)"
+    libelle_enfants = (
+        f" + structures enfants (niveau {niveau_enfants} · {noms_niv.get(niveau_enfants, 'niveau inférieur')})"
+        if avec_enfants else ""
+    )
     st.caption(
-        f"{len(res['tables'])} tableau(x) chargé(s) · district : {nom_unite} (structures enfants incluses) · période : "
+        f"{len(res['tables'])} tableau(x) chargé(s) · unité : {nom_unite}{libelle_enfants} · période : "
         f"{', '.join(map(str, annees_val))} · {libelle_mois}"
     )
     if res["erreurs"]:
@@ -2088,22 +2400,85 @@ def onglet_validation():
     if res["autres"]:
         with st.expander(f"Autres éléments du tableau de bord, non chargés ({len(res['autres'])})"):
             st.write("\n".join(f"- {a}" for a in res["autres"]))
+    # --- consignes de validation appliquées à chaque tableau ---
+    options_cons = [0] + list(REGLES_2020)
+    analyses = []
     for t in res["tables"]:
-        with st.expander(f"📋 {t['nom']}", expanded=len(res["tables"]) <= 3):
-            if t["df"].empty:
-                st.info("Aucune donnée renvoyée pour ce tableau.")
-            else:
-                st.dataframe(t["df"], hide_index=True, use_container_width=True)
-            st.caption(
-                f"Type : {t['type']} · {t['nb_lignes_analytics']} ligne(s) renvoyée(s) par analytics · "
-                f"lignes : {', '.join(t['lignes']) or '–'} · colonnes : {', '.join(t['colonnes']) or '–'}"
+        cle = f"val_cons_{t['id']}"
+        defaut = trouver_consigne(t["nom"]) or 0
+        choix = st.session_state.get(cle, defaut)
+        consigne = REGLES_2020.get(choix)
+        if t["df"].empty or consigne is None or not t.get("rep"):
+            ev = {"erreurs": set(), "details": [], "diagnostic": []}
+        else:
+            ev = evaluer_regles(t["rep"], consigne)
+        analyses.append((t, cle, defaut, choix, ev))
+
+    st.markdown("#### Synthèse des erreurs par tableau")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Tableau": t["nom"],
+                    "Consignes appliquées": f"{c}. {REGLES_2020[c]['titre']}" if c else "Aucune",
+                    "Erreurs détectées": len(ev["details"]),
+                }
+                for t, _cle, _d, c, ev in analyses
+            ]
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        f"🟨 Les cellules sur fond jaune ({COULEUR_ERREUR}) sont celles concernées par une consigne "
+        "de validation non respectée."
+    )
+
+    for t, cle, defaut, choix, ev in analyses:
+        with st.expander(
+            f"📋 {t['nom']} · {len(ev['details'])} erreur(s)", expanded=len(res["tables"]) <= 3
+        ):
+            st.selectbox(
+                "Consignes appliquées à ce tableau",
+                options=options_cons,
+                index=options_cons.index(defaut),
+                format_func=lambda n: "Aucune" if n == 0 else f"{n}. {REGLES_2020[n]['titre']}",
+                key=cle,
             )
-            with st.expander("Requête analytics utilisée"):
-                st.json(t["requete"])
+            onglet_t, onglet_e, onglet_r = st.tabs(
+                ["Tableau", f"Erreurs ({len(ev['details'])})", "Règles appliquées"]
+            )
+            with onglet_t:
+                if t["df"].empty or not t.get("rep"):
+                    st.info("Aucune donnée renvoyée pour ce tableau.")
+                else:
+                    tt, masque = _construire(t["rep"], t["lignes"], t["colonnes"], ev["erreurs"])
+                    st.dataframe(styler_erreurs(tt, masque), hide_index=True, use_container_width=True)
+                st.caption(
+                    f"Type : {t['type']} · {t['nb_lignes_analytics']} ligne(s) renvoyée(s) par analytics · "
+                    f"lignes : {', '.join(t['lignes']) or '–'} · colonnes : {', '.join(t['colonnes']) or '–'}"
+                )
+                if st.checkbox("Afficher la requête analytics utilisée", key=f"req_{t['id']}"):
+                    st.json(t["requete"])
+            with onglet_e:
+                if ev["details"]:
+                    st.dataframe(pd.DataFrame(ev["details"]), hide_index=True, use_container_width=True)
+                else:
+                    st.success("Aucune erreur détectée.") if choix else st.info("Aucune consigne appliquée.")
+            with onglet_r:
+                if ev["diagnostic"]:
+                    st.dataframe(pd.DataFrame(ev["diagnostic"]), hide_index=True, use_container_width=True)
+                    st.caption(
+                        "Les éléments de données sont repérés par mots-clés dans leurs libellés. "
+                        "Une règle « non appliquée » signale un libellé introuvable : vérifiez les noms "
+                        "des éléments du tableau."
+                    )
+                else:
+                    st.info("Aucune consigne appliquée.")
 
 
-tab_ext, tab_comp, tab_qd, tab_db, tab_val = st.tabs(
-    ["📥 Extraction", "✅ Complétude", "🔍 Qualité des données", "📊 Tableaux de bord", "🧪 Validation"]
+tab_ext, tab_comp, tab_qd, tab_val = st.tabs(
+    ["📥 Extraction", "✅ Complétude", "🔍 Qualité des données", "🧪 Validation"]
 )
 with tab_ext:
     onglet_extraction()
@@ -2111,7 +2486,5 @@ with tab_comp:
     onglet_completude()
 with tab_qd:
     onglet_qualite()
-with tab_db:
-    onglet_dashboard()
 with tab_val:
     onglet_validation()
