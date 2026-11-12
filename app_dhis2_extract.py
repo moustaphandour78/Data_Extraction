@@ -25,6 +25,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -50,6 +51,27 @@ def secret(cle: str, defaut: str = "") -> str:
         return st.secrets.get(cle, defaut)
     except Exception:
         return defaut
+
+
+def _valeurs_sensibles() -> list:
+    """URL, hôtes, identifiants, mots de passe et jetons configurés (à ne jamais afficher)."""
+    brutes = [str(secret(c) or "") for c in
+              ("DHIS2_URL", "DHIS2_USER", "DHIS2_PASSWORD", "DHIS2_TOKEN", "TRACKER_USER")]
+    for iid in str(secret("TRACKER_INSTANCES", "") or "").split(","):
+        iid = iid.strip()
+        if iid:
+            cle = re.sub(r"[^A-Za-z0-9]+", "_", iid).upper()
+            brutes += [str(secret(f"TRACKER_{cle}_{c}") or "") for c in ("URL", "USER", "PASSWORD")]
+    hotes = [urlparse(v).netloc for v in brutes if v.startswith("http")]
+    return sorted({v for v in brutes + hotes if len(v) >= 4}, key=len, reverse=True)
+
+
+def masquer_secrets(valeur) -> str:
+    """Texte (ex. message d'erreur) dont les adresses, identifiants et jetons sont remplacés par ***."""
+    texte = str(valeur)
+    for v in _valeurs_sensibles():
+        texte = texte.replace(v, "***")
+    return texte
 
 
 def make_session(mode: str, user: str, password: str, token: str) -> requests.Session:
@@ -934,7 +956,7 @@ def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, peri
                 }
             )
         except Exception as e:
-            erreurs.append(f"{nom_viz} : {e}")
+            erreurs.append(f"{nom_viz} : {masquer_secrets(e)}")
     return {
         "id": dashboard_id,
         "nom": dash.get("displayName", dashboard_id),
@@ -947,24 +969,32 @@ def charger_tableaux_dashboard(dashboard_id: str, inclure_graphiques: bool, peri
 # ------------------------------------------------------------------
 # Barre latérale : connexion
 # ------------------------------------------------------------------
-st.sidebar.header("🔌 Connexion DHIS2")
-url = st.sidebar.text_input(
-    "URL de l'API", value=secret("DHIS2_URL", "https://play.dhis2.org/demo/api")
-).rstrip("/")
-mode = st.sidebar.radio("Authentification", ["Login / mot de passe", "Token (PAT)"])
+url_conf = secret("DHIS2_URL").rstrip("/")
+token_conf, user_conf, pwd_conf = secret("DHIS2_TOKEN"), secret("DHIS2_USER"), secret("DHIS2_PASSWORD")
+CONNEXION_CONFIGUREE = bool(url_conf and (token_conf or (user_conf and pwd_conf)))
 
-user = password = token = ""
-if mode == "Login / mot de passe":
-    user = st.sidebar.text_input("Utilisateur", value=secret("DHIS2_USER", "admin"))
-    password = st.sidebar.text_input(
-        "Mot de passe", value=secret("DHIS2_PASSWORD", "district"), type="password"
-    )
+if CONNEXION_CONFIGUREE:
+    # Identifiants fournis par .env / secrets : aucun champ n'est affiché ni envoyé au navigateur
+    url = url_conf
+    if token_conf:
+        mode, token, user, password = "Token (PAT)", token_conf, "", ""
+    else:
+        mode, user, password, token = "Login / mot de passe", user_conf, pwd_conf, ""
+    if st.sidebar.button("🔄 Rafraîchir les listes"):
+        st.cache_data.clear()
 else:
-    token = st.sidebar.text_input("Token", value=secret("DHIS2_TOKEN"), type="password")
-
-connecte = st.sidebar.button("Se connecter / rafraîchir les listes")
-if connecte:
-    st.cache_data.clear()
+    st.sidebar.header("🔌 Connexion DHIS2")
+    st.sidebar.caption("Aucun identifiant configuré (.env ou secrets) : saisie manuelle, non enregistrée.")
+    url = st.sidebar.text_input("URL de l'API", value="https://play.dhis2.org/demo/api").rstrip("/")
+    mode = st.sidebar.radio("Authentification", ["Login / mot de passe", "Token (PAT)"])
+    user = password = token = ""
+    if mode == "Login / mot de passe":
+        user = st.sidebar.text_input("Utilisateur", value="admin")
+        password = st.sidebar.text_input("Mot de passe", value="district", type="password")
+    else:
+        token = st.sidebar.text_input("Token", type="password")
+    if st.sidebar.button("Se connecter / rafraîchir les listes"):
+        st.cache_data.clear()
 
 # ------------------------------------------------------------------
 # Corps de la page
@@ -975,7 +1005,7 @@ try:
     df_ds = lister(url, mode, user, password, token, "dataSets")
     df_ou = lister(url, mode, user, password, token, "organisationUnits")
 except Exception as e:
-    st.error(f"Connexion impossible : {e}")
+    st.error(f"Connexion impossible : {masquer_secrets(e)}")
     st.stop()
 
 st.sidebar.success(f"{len(df_ds)} formulaires, {len(df_ou)} unités d'organisation")
@@ -1054,7 +1084,7 @@ def onglet_extraction():
                     morceaux.append(df)
                 barre.progress((i + 1) / len(annees), text=f"Année {a} : {len(df)} valeurs")
         except Exception as e:
-            st.error(f"Erreur pendant l'extraction : {e}")
+            st.error(f"Erreur pendant l'extraction : {masquer_secrets(e)}")
             return
         barre.empty()
 
@@ -1146,7 +1176,7 @@ def calculer_carte(choix, annees, trimestres) -> dict:
             for g in geometries_niveau(url, mode, user, password, token, u["id"], niveau):
                 geoms[g["id"]] = g
         except Exception as e:
-            erreurs.append(f"Géométries ({u['displayName']}) : {e}")
+            erreurs.append(f"Géométries ({u['displayName']}) : {masquer_secrets(e)}")
         for ds_id in choix:
             try:
                 d = completude_niveau_cache(
@@ -1155,7 +1185,7 @@ def calculer_carte(choix, annees, trimestres) -> dict:
                 )
                 mesures.append(d.assign(formulaire=noms_ds.get(ds_id, ds_id)))
             except Exception as e:
-                erreurs.append(f"{noms_ds.get(ds_id, ds_id)} ({u['displayName']}) : {e}")
+                erreurs.append(f"{noms_ds.get(ds_id, ds_id)} ({u['displayName']}) : {masquer_secrets(e)}")
 
     if mesures:
         allv = pd.concat(mesures, ignore_index=True)
@@ -1311,7 +1341,7 @@ def section_comparaison(res: dict):
             ia = indicateurs_periode(res["choix"], unites, *options[la])
             ib = indicateurs_periode(res["choix"], unites, *options[lb])
     except Exception as e:
-        st.warning(f"Comparaison impossible : {e}")
+        st.warning(f"Comparaison impossible : {masquer_secrets(e)}")
         return
 
     df, sens = tableau_comparaison(ia, ib, la, lb)
@@ -1375,14 +1405,14 @@ def onglet_completude():
                 )
                 morceaux.append(c.assign(formulaire=noms_ds.get(ds_id, ds_id)))
             except Exception as e:
-                erreurs.append(f"{noms_ds.get(ds_id, ds_id)} : {e}")
+                erreurs.append(f"{noms_ds.get(ds_id, ds_id)} : {masquer_secrets(e)}")
             barre.progress((i + 1) / len(choix), text=noms_ds.get(ds_id, ds_id))
         barre.text("Calcul de la carte…")
         try:
             carte = calculer_carte(choix, annees, trimestres)
         except Exception as e:
             carte = None
-            erreurs.append(f"Carte : {e}")
+            erreurs.append(f"Carte : {masquer_secrets(e)}")
         barre.empty()
         st.session_state["comp_result"] = {
             "data": pd.concat(morceaux, ignore_index=True) if morceaux else None,
@@ -1572,7 +1602,7 @@ def sous_onglet_validation(orgunit_id, debut, fin):
     try:
         groupes = groupes_validation(url, mode, user, password, token)
     except Exception as e:
-        st.error(f"Impossible de lire les groupes de règles de validation : {e}")
+        st.error(f"Impossible de lire les groupes de règles de validation : {masquer_secrets(e)}")
         return
     if not groupes:
         st.info("Aucun groupe de règles de validation n'est défini sur cette instance.")
@@ -1599,7 +1629,7 @@ def sous_onglet_validation(orgunit_id, debut, fin):
                 url, mode, user, password, token
             )
         except Exception as e:
-            st.error(f"Impossible de lire les métadonnées (règles, formulaires) : {e}")
+            st.error(f"Impossible de lire les métadonnées (règles, formulaires) : {masquer_secrets(e)}")
             return
 
         lignes, resume, erreurs = [], [], []
@@ -1611,7 +1641,7 @@ def sous_onglet_validation(orgunit_id, debut, fin):
                     url, mode, user, password, token, g_id, orgunit_id, debut.isoformat(), fin.isoformat()
                 )
             except Exception as e:
-                erreurs.append(f"{noms_g[g_id]} : {e}")
+                erreurs.append(f"{noms_g[g_id]} : {masquer_secrets(e)}")
                 continue
             resume.append({"Groupe": noms_g[g_id], "Erreurs détectées": len(violations)})
             for v in violations:
@@ -1707,7 +1737,7 @@ def sous_onglet_aberrantes(orgunit_id, debut, fin):
                     debut.isoformat(), fin.isoformat(), algo, float(seuil), int(max_res),
                 )
         except Exception as e:
-            st.error(f"Analyse impossible (droits insuffisants, version de DHIS2 trop ancienne ou erreur serveur) : {e}")
+            st.error(f"Analyse impossible (droits insuffisants, version de DHIS2 trop ancienne ou erreur serveur) : {masquer_secrets(e)}")
             return
         lignes = []
         for v in valeurs:
@@ -1834,7 +1864,7 @@ def sous_onglet_manquantes(orgunit_id, debut, fin):
         try:
             de_ds, noms_de, noms_formulaires = elements_et_formulaires(url, mode, user, password, token)
         except Exception as e:
-            st.error(f"Impossible de lire les métadonnées (formulaires, éléments) : {e}")
+            st.error(f"Impossible de lire les métadonnées (formulaires, éléments) : {masquer_secrets(e)}")
             return
         ds_de = {}
         for de, dss in de_ds.items():
@@ -1858,7 +1888,7 @@ def sous_onglet_manquantes(orgunit_id, debut, fin):
                     url, mode, user, password, token, ds_id, orgunit_id, debut.isoformat(), fin.isoformat()
                 )
             except Exception as e:
-                erreurs.append(f"{nom} : {e}")
+                erreurs.append(f"{nom} : {masquer_secrets(e)}")
                 continue
             analysees += len(subs)
             l, d = calculer_manquantes(subs, vals, elements, noms_de, nom, ds_id, noms_ou)
@@ -2312,7 +2342,7 @@ def onglet_validation():
         df_un = unites_avec_niveau(url, mode, user, password, token)
         noms_niv = noms_niveaux(url, mode, user, password, token)
     except Exception as e:
-        st.error(f"Impossible de lire les unités d'organisation : {e}")
+        st.error(f"Impossible de lire les unités d'organisation : {masquer_secrets(e)}")
         return
 
     c1, c2, c3 = st.columns([2, 1, 2])
@@ -2380,7 +2410,7 @@ def onglet_validation():
             st.session_state.pop("val_result", None)
             st.error(
                 "Impossible de charger le tableau de bord de validation "
-                f"(ID incorrect, droits insuffisants ou erreur serveur) : {e}"
+                f"(ID incorrect, droits insuffisants ou erreur serveur) : {masquer_secrets(e)}"
             )
 
     res = st.session_state.get("val_result")
@@ -2487,7 +2517,7 @@ def onglet_validation():
 EXEMPLE_ENV = """TRACKER_USER=lecture_tracker
 TRACKER_INSTANCES=SURVEILLANCE
 TRACKER_SURVEILLANCE_NOM=Surveillance
-TRACKER_SURVEILLANCE_URL=https://minsante.sec.gouv.sn/surveillance/api
+TRACKER_SURVEILLANCE_URL=https://mon-instance.org/surveillance/api
 TRACKER_SURVEILLANCE_PASSWORD=mot_de_passe_de_cette_instance"""
 
 
@@ -2531,8 +2561,8 @@ def erreur_http(e: Exception) -> str:
             msg = rep.json().get("message")
         except Exception:
             msg = None
-        return f"HTTP {rep.status_code}" + (f" : {msg}" if msg else "")
-    return str(e)
+        return masquer_secrets(f"HTTP {rep.status_code}" + (f" : {msg}" if msg else ""))
+    return masquer_secrets(e)
 
 
 def tester_instance(cfg: dict) -> dict:
@@ -3308,7 +3338,10 @@ def onglet_tracker():
             with ThreadPoolExecutor(max_workers=min(4, len(selection))) as ex:
                 st.session_state["tr_test"] = list(ex.map(lambda i: tester_instance(instances[i]), selection))
     if st.session_state.get("tr_test"):
-        st.dataframe(pd.DataFrame(st.session_state["tr_test"]), hide_index=True, use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(st.session_state["tr_test"]).drop(columns=["URL", "Compte"], errors="ignore"),
+            hide_index=True, use_container_width=True,
+        )
     if not selection:
         return
 
