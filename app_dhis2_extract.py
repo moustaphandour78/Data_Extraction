@@ -1,5 +1,5 @@
 """
-V11
+V13
 Application Streamlit : extraction de données DHIS2
 (un formulaire x une unité d'organisation x N dernières années)
 Cinq onglets indépendants : « Extraction », « Complétude », « Qualité des données »,
@@ -201,6 +201,91 @@ def tableau_colore(df: pd.DataFrame, colonnes_taux: list, formats: dict):
     sty = df.style.format(formats, na_rep="–")
     appliquer = getattr(sty, "map", None) or sty.applymap
     return appliquer(style_completude, subset=colonnes_taux)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=30)
+def excel_completude(df: pd.DataFrame, colonnes_taux: tuple, feuille: str = "Complétude") -> bytes:
+    """Fichier Excel du tableau : taux arrondis à 2 décimales et cellules colorées selon la légende
+    (0–70 % rouge, 70–90 % jaune, 90–100 % vert), légende rappelée sous le tableau."""
+    from io import BytesIO
+
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    colonnes_taux = [c for c in colonnes_taux if c in df.columns]
+    sortie = df.copy()
+    for c in colonnes_taux:
+        sortie[c] = pd.to_numeric(sortie[c], errors="coerce").round(2)
+    originaux = {c: sortie[c].to_numpy() for c in colonnes_taux}  # couleur calculée sur la valeur affichée (arrondie)
+    remplir = lambda hexa: PatternFill("solid", fgColor=hexa.lstrip("#"))
+    texte = lambda hexa: "000000" if hexa == COULEURS_CLASSES[LIB_JAUNE] else "FFFFFF"
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        sortie.to_excel(w, sheet_name=feuille, index=False)
+        ws = w.sheets[feuille]
+        for cell in ws[1]:
+            cell.fill = remplir("#1F3A5F")
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        position = {c: i for i, c in enumerate(sortie.columns, start=1)}
+        for c in colonnes_taux:
+            for k, v in enumerate(originaux[c]):
+                if pd.isna(v):
+                    continue
+                cell = ws.cell(row=k + 2, column=position[c])
+                couleur = COULEURS_CLASSES[classe_completude(v)]
+                cell.fill = remplir(couleur)
+                cell.font = Font(color=texte(couleur))
+                cell.number_format = "0.00"
+        for c, j in position.items():
+            lettre = ws.cell(row=1, column=j).column_letter
+            if c in colonnes_taux:
+                ws.column_dimensions[lettre].width = 16
+            else:
+                longueur = max([len(str(c))] + [len(str(x)) for x in sortie[c].head(300)])
+                ws.column_dimensions[lettre].width = min(40, max(10, longueur + 2))
+        if colonnes_taux:
+            ws.row_dimensions[1].height = 48
+            ws.freeze_panes = ws.cell(row=2, column=min(position[c] for c in colonnes_taux))
+        ligne = len(sortie) + 3  # légende sous le tableau
+        ws.cell(row=ligne, column=1, value="Légende").font = Font(bold=True)
+        for k, (lib, couleur) in enumerate(list(COULEURS_CLASSES.items())[:3], start=1):
+            cell = ws.cell(row=ligne + k, column=1, value=lib)
+            cell.fill = remplir(couleur)
+            cell.font = Font(color=texte(couleur), bold=True)
+    return buf.getvalue()
+
+
+def boutons_telechargement(df: pd.DataFrame, colonnes_taux: list, nom_fichier: str, cle: str):
+    """Excel avec les couleurs de la légende (un CSV ne peut pas porter de couleurs) et CSV sans couleurs ;
+    dans les deux cas, taux arrondis à 2 décimales."""
+    colonnes_taux = [c for c in colonnes_taux if c in df.columns]
+    arrondi = df.copy()
+    for c in colonnes_taux:
+        arrondi[c] = pd.to_numeric(arrondi[c], errors="coerce").round(2)
+    b1, b2 = st.columns(2)
+    b1.download_button(
+        "⬇️ Excel avec couleurs de la légende (.xlsx)",
+        data=excel_completude(df, tuple(colonnes_taux)),
+        file_name=f"{nom_fichier}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"{cle}_xlsx",
+    )
+    b2.download_button(
+        "⬇️ CSV sans couleurs",
+        data=arrondi.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{nom_fichier}.csv",
+        mime="text/csv",
+        key=f"{cle}_csv",
+    )
+
+
+def colonnes_figees(df: pd.DataFrame, colonnes: tuple) -> dict:
+    """Configuration Streamlit : colonnes d'identification figées au défilement (si la version le permet)."""
+    try:
+        return {c: st.column_config.Column(pinned=True) for c in colonnes if c in df.columns}
+    except TypeError:
+        return {}
 
 
 def _analytics_rows(s, url, dx: str, pe: str, ou: str) -> pd.DataFrame:
@@ -1360,11 +1445,304 @@ def section_comparaison(res: dict):
     )
 
 
+# ---- Complétude : formulaires par défaut et synthèse par district et par mois ----
+# Liste proposée par défaut dans l'onglet Complétude (fichier formulaire defaut.txt).
+# Le suffixe « - Reporting rate » est ignoré : seuls les noms de formulaires comptent.
+FORMULAIRES_DEFAUT = [
+    "R20_Planification Familiale - Reporting rate",
+    "R20_Santé de la mère et du nouveau né - Reporting rate",
+    "R20_Santé de l’enfant - Reporting rate",
+    "R21_VIH_Rapport Mensuel PTME Poste de Santé - Reporting rate",
+    "R21_VIH_Rapport PTME EPS ET CS - Reporting rate",
+    "PEV: Rapport mensuel de vaccination par stratégie - Reporting rate",
+    "R20_Prévention et Prise en Charge Maladie - PS - Reporting rate",
+    "R20_Prévention et Prise en Charge de la Maladie - CS - Reporting rate",
+    "R20_Rapport Global : Morbidite et Mortalite du PS - Reporting rate",
+    "R20_Rapport Global : Morbidite et Mortalite du CS - Reporting rate",
+    "MTN : Prise en Charge cas par cas - Reporting rate",
+    "MTN : Rapport Mensuel PS - Reporting rate",
+    "MTN : Rapport Mensuel Centre de sante & EPS - Reporting rate",
+    "R22_Sante Bucco-dentaire : Rapport Mensuel - Reporting rate",
+    "R24_VIH_Rapport Mensuel de notification syndromique des IST et diagnostic étiologique de la syphilis - Reporting rate",
+    "R24_VIH_Rapport mensuel Laboratoire - Reporting rate",
+    "R21_VIH_Rapport mensuel PEC Poste - Reporting rate",
+    "Paludisme : Rapport mensuel Poste de Santé - Reporting rate",
+    "Paludisme : Rapport mensuel Centre de Santé - Reporting rate",
+    "Paludisme : Rapport mensuel EPS - Reporting rate",
+]
+
+
+def ids_formulaires_defaut() -> tuple:
+    """(ID des formulaires par défaut présents sur l'instance, noms introuvables)."""
+    index = {normaliser(nom): i for i, nom in noms_ds.items()}
+    ids, introuvables = [], []
+    for brut in FORMULAIRES_DEFAUT:
+        nom = re.sub(r"\s*-\s*reporting rate\s*$", "", brut, flags=re.IGNORECASE)
+        cible = normaliser(nom)
+        if cible in index:
+            ids.append(index[cible])
+            continue
+        meilleur = max(index, key=lambda k: SequenceMatcher(None, cible, k).ratio(), default=None)
+        if meilleur and SequenceMatcher(None, cible, meilleur).ratio() >= 0.92:
+            ids.append(index[meilleur])
+        else:
+            introuvables.append(nom)
+    return list(dict.fromkeys(ids)), introuvables
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def niveaux_hierarchie(url, mode, user, password, token) -> dict:
+    """Niveaux de la hiérarchie : {numéro: nom}. Vide si la lecture échoue."""
+    try:
+        s = make_session(mode, user, password, token)
+        r = s.get(f"{url}/organisationUnitLevels.json",
+                  params={"fields": "level,displayName", "paging": "false", "order": "level:asc"}, timeout=60)
+        r.raise_for_status()
+        return {int(x["level"]): x["displayName"] for x in r.json().get("organisationUnitLevels", [])}
+    except Exception:
+        return {}
+
+
+def niveau_district(unites: list) -> tuple:
+    """(numéro, nom) du niveau « district » : celui dont le nom contient « district »,
+    sinon deux niveaux sous un utilisateur national, un niveau sous un utilisateur régional."""
+    niveaux = niveaux_hierarchie(url, mode, user, password, token)
+    for niv, nom in sorted(niveaux.items()):
+        if "district" in normaliser(nom):
+            return niv, nom
+    niv_racine = min(int(u.get("level", 1)) for u in unites)
+    niv = niv_racine + (2 if niv_racine == 1 else 1)
+    return niv, niveaux.get(niv, f"niveau {niv}")
+
+
+def mois_depuis(annees: list, trimestres: list) -> list:
+    """Mois (202601…) des années et trimestres choisis, déjà commencés."""
+    auj, sortie = datetime.date.today(), []
+    for a in sorted(annees):
+        for q in sorted(trimestres):
+            sortie += [f"{a}{m:02d}" for m in range(3 * q - 2, 3 * q + 1) if datetime.date(a, m, 1) <= auj]
+    return sortie
+
+
+def libelle_mois(pe: str) -> str:
+    return f"{MOIS_FR[int(pe[4:6]) - 1]} {pe[:4]}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def completude_districts_cache(url, mode, user, password, token, datasets, ou_dim, mois) -> pd.DataFrame:
+    """Rapports attendus / saisis par unité, mois et formulaire (plusieurs formulaires par requête)."""
+    s = make_session(mode, user, password, token)
+    cols = ["ou", "pe", "ds", "attendus", "saisis"]
+    morceaux = []
+    for i in range(0, len(datasets), 10):
+        lot = datasets[i:i + 10]
+        dx = ";".join(f"{d}.{m}" for d in lot for m in METRIQUES_RAPPORTS)
+        df = _analytics_rows(s, url, dx, ";".join(mois), ou_dim)
+        if df.empty:
+            continue
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df["ds"] = df["dx"].str.split(".").str[0]
+        df["metrique"] = df["dx"].str.split(".").str[-1]
+        piv = (
+            df.pivot_table(index=["ou", "pe", "ds"], columns="metrique", values="value", aggfunc="sum")
+            .reindex(columns=METRIQUES_RAPPORTS)
+            .reset_index()
+        )
+        morceaux.append(piv.rename(columns={"EXPECTED_REPORTS": "attendus", "ACTUAL_REPORTS": "saisis"}))
+    return pd.concat(morceaux, ignore_index=True)[cols] if morceaux else pd.DataFrame(columns=cols)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def unites_niveau(url, mode, user, password, token, racine, niveau) -> list:
+    """Unités du niveau demandé sous `racine`, avec leur parent (la région d'un district)."""
+    s = make_session(mode, user, password, token)
+    r = s.get(
+        f"{url}/organisationUnits.json",
+        params={"fields": "id,displayName,parent[displayName]",
+                "filter": [f"level:eq:{niveau}", f"path:like:{racine}"], "paging": "false"},
+        timeout=300,
+    )
+    r.raise_for_status()
+    return r.json().get("organisationUnits", [])
+
+
+def calculer_districts_mensuel(choix: list, annees: list, trimestres: list) -> dict:
+    """Taux de complétude par district et par mois : moyenne des taux des formulaires choisis."""
+    unites = unites_assignees(url, mode, user, password, token)
+    niv, nom_niveau = niveau_district(unites)
+    mois = mois_depuis(annees, trimestres)
+    if not mois:
+        raise ValueError("Aucun mois déjà commencé dans les années et trimestres choisis.")
+    frames, regions, erreurs = [], {}, []
+    for u in unites:
+        niv_r = int(u.get("level", 1))
+        if niv < niv_r:
+            continue
+        ou_dim = u["id"] if niv == niv_r else f"LEVEL-{niv};{u['id']}"
+        try:
+            frames.append(completude_districts_cache(url, mode, user, password, token, tuple(choix), ou_dim, tuple(mois)))
+        except Exception as e:
+            erreurs.append(f"{u['displayName']} : {masquer_secrets(e)}")
+        try:  # liste complète des districts (ceux sans donnée apparaissent aussi) et leur région
+            for x in unites_niveau(url, mode, user, password, token, u["id"], niv):
+                regions[x["id"]] = (x["displayName"], (x.get("parent") or {}).get("displayName", ""))
+        except Exception:
+            pass
+    if erreurs and not frames:
+        raise RuntimeError(" ; ".join(erreurs))
+    allv = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["ou", "pe", "ds", "attendus", "saisis"])
+    allv[["attendus", "saisis"]] = allv[["attendus", "saisis"]].astype(float)
+    allv["taux"] = (allv["saisis"] / allv["attendus"] * 100).where(allv["attendus"] > 0)
+    par_mois = allv.groupby(["ou", "pe"])["taux"].mean().reset_index()
+    piv = par_mois.pivot(index="ou", columns="pe", values="taux") if not par_mois.empty else pd.DataFrame()
+    ids = sorted(set(piv.index) | set(regions))
+    piv = piv.reindex(index=ids, columns=[m for m in mois if m in piv.columns]).dropna(axis=1, how="all")
+    piv.columns = [libelle_mois(c) for c in piv.columns]
+    colonnes = list(piv.columns)
+    piv["Moyenne"] = piv.mean(axis=1, skipna=True) if colonnes else float("nan")
+    piv = piv.reset_index().rename(columns={"index": "id", "ou": "id"})
+    piv.insert(0, "District", piv["id"].map(lambda i: (regions.get(i) or (noms_ou.get(i, i), ""))[0]))
+    if any(r for _, r in regions.values()):
+        piv.insert(0, "Région", piv["id"].map(lambda i: (regions.get(i) or ("", ""))[1]))
+    piv = piv.drop(columns="id")
+    piv = piv.sort_values([c for c in ("Région", "District") if c in piv.columns]).reset_index(drop=True)
+
+    # Détail sans synthèse : une ligne par (district, mois), une colonne par formulaire
+    detail = {"table": pd.DataFrame(), "colonnes": []}
+    if not allv.empty and allv["taux"].notna().any():
+        det = allv.pivot_table(index=["ou", "pe"], columns="ds", values="taux", aggfunc="first")
+        det = det.reindex(columns=[d for d in choix if d in det.columns]).dropna(how="all")
+        det.columns = [noms_ds.get(d, d) for d in det.columns]
+        formulaires = list(det.columns)
+        det = det.reset_index()
+        det.insert(0, "District", det["ou"].map(lambda i: (regions.get(i) or (noms_ou.get(i, i), ""))[0]))
+        cles_tri = ["District", "pe"]
+        if any(r for _, r in regions.values()):
+            det.insert(0, "Région", det["ou"].map(lambda i: (regions.get(i) or ("", ""))[1]))
+            cles_tri = ["Région"] + cles_tri
+        det = det.sort_values(cles_tri)
+        det["Mois"] = det["pe"].map(libelle_mois)
+        ident = [c for c in ("Région", "District") if c in det.columns] + ["Mois"]
+        detail = {"table": det[ident + formulaires].reset_index(drop=True), "colonnes": formulaires}
+    return {"table": piv, "colonnes": colonnes + ["Moyenne"], "niveau": nom_niveau, "erreurs": erreurs, "detail": detail}
+
+
+def tableau_districts_mois(res: dict):
+    """Tableau district × mois (taux de complétude moyen des formulaires), avec la légende rouge/jaune/vert."""
+    d = res.get("districts")
+    if d is None:
+        return
+    tab = d["table"]
+    nom = d["niveau"].lower()
+    st.subheader(f"Complétude par {nom} et par mois")
+    if tab.empty or not d["colonnes"][:-1]:
+        st.info("Aucune donnée de complétude par mois pour ce niveau.")
+        return
+    st.caption(
+        f"Moyenne des taux de complétude des formulaires sélectionnés, pour chaque {nom} et chaque mois. "
+        f"Légende : {LEGENDE_COMPLETUDE}"
+    )
+    if d["erreurs"]:
+        st.warning("Certaines unités n'ont pas pu être interrogées : " + " ; ".join(d["erreurs"]))
+    st.dataframe(
+        tableau_colore(tab, d["colonnes"], {c: "{:.1f}" for c in d["colonnes"]}),
+        hide_index=True,
+        use_container_width=True,
+        height=min(720, 38 + 35 * len(tab)),
+        column_config=colonnes_figees(tab, ("Région", "District")),
+    )
+    boutons_telechargement(tab, d["colonnes"], "dhis2_completude_districts_mois", "dl_districts")
+
+
+MAX_LIGNES_DETAIL = 3000
+
+
+def tableau_detail_formulaires(res: dict):
+    """Détail sans synthèse : une ligne par district et par mois, une colonne par formulaire."""
+    d = res.get("districts")
+    if d is None or d.get("detail") is None:
+        return
+    det, formulaires = d["detail"]["table"], d["detail"]["colonnes"]
+    nom = d["niveau"].lower()
+    st.subheader(f"Complétude par formulaire, {nom} et mois (détail)")
+    if det.empty or not formulaires:
+        st.info("Aucune donnée de complétude par formulaire pour ce niveau.")
+        return
+    st.caption(
+        f"Taux de complétude de chaque formulaire, pour chaque {nom} et chaque mois, sans moyenne. "
+        f"Légende : {LEGENDE_COMPLETUDE}"
+    )
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        sel_reg = filtre_multi("Région", sorted(det["Région"].unique()), "cd_f_reg") if "Région" in det.columns else []
+    with f2:
+        sel_dis = filtre_multi(d["niveau"], sorted(det["District"].unique()), "cd_f_dis")
+    with f3:
+        mois_dispo = list(dict.fromkeys(det["Mois"]))  # ordre chronologique
+        sel_mois = filtre_multi("Mois", mois_dispo, "cd_f_mois")
+    for col, sel in (("Région", sel_reg), ("District", sel_dis), ("Mois", sel_mois)):
+        if sel:
+            det = det[det[col].isin(sel)]
+    if det.empty:
+        st.info("Aucune ligne ne correspond aux filtres choisis.")
+        return
+    aff = det.head(MAX_LIGNES_DETAIL)
+    if len(det) > MAX_LIGNES_DETAIL:
+        st.caption(
+            f"Affichage limité aux {MAX_LIGNES_DETAIL} premières lignes sur {len(det)} : filtrez ci-dessus "
+            "ou téléchargez le fichier complet."
+        )
+    st.dataframe(
+        tableau_colore(aff, formulaires, {c: "{:.1f}" for c in formulaires}),
+        hide_index=True,
+        use_container_width=True,
+        height=min(720, 38 + 35 * len(aff)),
+        column_config=colonnes_figees(aff, ("Région", "District", "Mois")),
+    )
+    boutons_telechargement(det, formulaires, "dhis2_completude_formulaires_districts_mois", "dl_detail")
+
+
+def section_carte(res: dict):
+    """Carte de la complétude moyenne par unité (niveau sous l'unité assignée)."""
+    carte = res.get("carte")
+    if carte is None:
+        return
+    st.subheader(f"Carte : complétude moyenne par {carte['libelle']}")
+    st.caption(
+        f"Moyenne des taux de complétude des formulaires sélectionnés, par {carte['libelle']} "
+        f"sous : {carte['racines']}. Légende : {LEGENDE_COMPLETUDE}"
+    )
+    tab = carte["table"]
+    if tab.empty:
+        st.info("Aucune unité trouvée pour ce niveau.")
+        return
+
+    ids_geo = {f["properties"]["id"] for f in carte["features"]}
+    if ids_geo:
+        etiquettes = st.checkbox(
+            "Afficher les étiquettes (nom et valeur)", value=True, key="carte_etiquettes"
+        )
+        try:
+            fig = construire_carte(
+                tab[tab["id"].isin(ids_geo)],
+                [f for f in carte["features"]],
+                etiquettes,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.warning("La carte nécessite plotly : `pip install plotly`.")
+    else:
+        st.info("Aucune géométrie (polygone) disponible pour ces unités : la carte ne peut pas être tracée.")
+
+
 def onglet_completude():
     st.caption(
         "Rapports attendus, saisis et taux de complétude (analytics DHIS2) pour un ou "
         "plusieurs formulaires, sur l'unité d'organisation choisie et ses descendantes."
     )
+    if "comp_ds" not in st.session_state:  # sélection par défaut : liste de formulaire defaut.txt
+        st.session_state["comp_ds"], introuvables_defaut = ids_formulaires_defaut()
+        st.session_state["comp_ds_introuvables"] = introuvables_defaut
     col1, col2 = st.columns(2)
     with col1:
         choix = st.multiselect(
@@ -1373,6 +1751,9 @@ def onglet_completude():
             format_func=lambda i: noms_ds.get(i, i),
             key="comp_ds",
         )
+        if st.session_state.get("comp_ds_introuvables"):
+            st.caption("Formulaires par défaut introuvables sur l'instance : "
+                       + " ; ".join(st.session_state["comp_ds_introuvables"]))
     with col2:
         orgunit_id = choisir_unite("comp")
     col3, col4 = st.columns(2)
@@ -1414,6 +1795,12 @@ def onglet_completude():
         except Exception as e:
             carte = None
             erreurs.append(f"Carte : {masquer_secrets(e)}")
+        barre.text("Calcul par district et par mois…")
+        try:
+            districts = calculer_districts_mensuel(choix, annees, trimestres)
+        except Exception as e:
+            districts = None
+            erreurs.append(f"Districts : {masquer_secrets(e)}")
         barre.empty()
         st.session_state["comp_result"] = {
             "data": pd.concat(morceaux, ignore_index=True) if morceaux else None,
@@ -1421,6 +1808,7 @@ def onglet_completude():
             "unite": noms_ou.get(orgunit_id, orgunit_id),
             "trimestres": ", ".join(f"T{q}" for q in trimestres),
             "carte": carte,
+            "districts": districts,
             "choix": list(choix),
             "annees": list(annees),
             "trimestres_liste": list(trimestres),
@@ -1459,6 +1847,7 @@ def onglet_completude():
             hide_index=True,
             use_container_width=True,
         )
+        boutons_telechargement(affichage, ["Complétude (%)"], "dhis2_completude_formulaires_annees", "dl_annees")
 
         st.markdown("**Comparaison des taux de complétude par année**")
         graph = comp.assign(annee=comp["annee"].astype(str)).pivot_table(
@@ -1471,43 +1860,9 @@ def onglet_completude():
 
     section_comparaison(res)
 
-    carte = res.get("carte")
-    if carte is None:
-        return
-    st.subheader(f"Carte : complétude moyenne par {carte['libelle']}")
-    st.caption(
-        f"Moyenne des taux de complétude des formulaires sélectionnés, par {carte['libelle']} "
-        f"sous : {carte['racines']}. Légende : {LEGENDE_COMPLETUDE}"
-    )
-    tab = carte["table"]
-    if tab.empty:
-        st.info("Aucune unité trouvée pour ce niveau.")
-        return
-
-    ids_geo = {f["properties"]["id"] for f in carte["features"]}
-    if ids_geo:
-        etiquettes = st.checkbox(
-            "Afficher les étiquettes (nom et valeur)", value=True, key="carte_etiquettes"
-        )
-        try:
-            fig = construire_carte(
-                tab[tab["id"].isin(ids_geo)],
-                [f for f in carte["features"]],
-                etiquettes,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        except ImportError:
-            st.warning("La carte nécessite plotly : `pip install plotly`.")
-    else:
-        st.info("Aucune géométrie (polygone) disponible pour ces unités : la carte ne peut pas être tracée.")
-
-    cols_form = [c for c in tab.columns if c not in ("id", "Unité", "Classe", COL_MOY)]
-    detail = tab[["Unité", COL_MOY] + cols_form].sort_values("Unité")
-    st.dataframe(
-        tableau_colore(detail, [COL_MOY] + cols_form, {c: "{:.1f}" for c in [COL_MOY] + cols_form}),
-        hide_index=True,
-        use_container_width=True,
-    )
+    section_carte(res)
+    tableau_detail_formulaires(res)
+    tableau_districts_mois(res)
 
 
 # ------------------------------------------------------------------
